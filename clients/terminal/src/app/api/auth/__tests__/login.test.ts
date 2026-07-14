@@ -26,6 +26,7 @@ beforeEach(() => {
 afterEach(() => {
   vi.restoreAllMocks();
   vi.unstubAllGlobals();
+  vi.unstubAllEnvs();
 });
 
 describe("/api/auth/login — direct email login against a mocked admin-api", () => {
@@ -102,5 +103,85 @@ describe("/api/auth/login — direct email login against a mocked admin-api", ()
     const res = await login(makeReq({ email: "not-an-email" }));
     expect(res.status).toBe(400);
     expect(fetchSpy).not.toHaveBeenCalled();
+  });
+});
+
+describe("/api/auth/login — DIRECT_LOGIN_EMAILS operator allowlist", () => {
+  /** Happy-path admin-api: any email resolves to a user and mints a token. */
+  function stubHappyFetch() {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (url: string) => {
+        if (url.includes("/admin/users/email/")) {
+          return new Response(JSON.stringify({ id: 2, email: "op@example.com", name: "Op" }), { status: 200 });
+        }
+        if (url.includes("/tokens")) return new Response(JSON.stringify({ token: "tok" }), { status: 200 });
+        return new Response("nope", { status: 500 });
+      }),
+    );
+  }
+
+  it("admits an exactly-listed non-test email", async () => {
+    vi.stubEnv("DIRECT_LOGIN_EMAILS", "op@example.com");
+    stubHappyFetch();
+    expect((await login(makeReq({ email: "op@example.com" }))).status).toBe(200);
+  });
+
+  it("normalizes case and outer whitespace on both sides of the match", async () => {
+    vi.stubEnv("DIRECT_LOGIN_EMAILS", "  Op@Example.com , other@x.io ");
+    stubHappyFetch();
+    expect((await login(makeReq({ email: "OP@example.com" }))).status).toBe(200);
+  });
+
+  it("empty comma entries admit nothing", async () => {
+    vi.stubEnv("DIRECT_LOGIN_EMAILS", ",,");
+    const fetchSpy = vi.fn();
+    vi.stubGlobal("fetch", fetchSpy);
+    expect((await login(makeReq({ email: "real@company.com" }))).status).toBe(403);
+    expect(fetchSpy).not.toHaveBeenCalled();
+  });
+
+  it("plus-addressing and trailing-dot variants of a listed email do not match", async () => {
+    vi.stubEnv("DIRECT_LOGIN_EMAILS", "op@example.com");
+    const fetchSpy = vi.fn();
+    vi.stubGlobal("fetch", fetchSpy);
+    expect((await login(makeReq({ email: "op+x@example.com" }))).status).toBe(403);
+    expect((await login(makeReq({ email: "op@example.com." }))).status).toBe(403);
+    expect(fetchSpy).not.toHaveBeenCalled();
+  });
+
+  it("a Unicode-confusable variant of a listed ASCII email does not match", async () => {
+    vi.stubEnv("DIRECT_LOGIN_EMAILS", "op@example.com");
+    const fetchSpy = vi.fn();
+    vi.stubGlobal("fetch", fetchSpy);
+    // Cyrillic "о" (U+043E) in place of ASCII "o".
+    expect((await login(makeReq({ email: "оp@example.com" }))).status).toBe(403);
+    expect(fetchSpy).not.toHaveBeenCalled();
+  });
+
+  it("fails closed on a non-local public origin, and reopens only with the explicit opt-in", async () => {
+    vi.stubEnv("DIRECT_LOGIN_EMAILS", "op@example.com");
+    vi.stubEnv("NEXTAUTH_URL", "https://vexa.example.com");
+    const fetchSpy = vi.fn();
+    vi.stubGlobal("fetch", fetchSpy);
+    expect((await login(makeReq({ email: "op@example.com" }))).status).toBe(403);
+    expect(fetchSpy).not.toHaveBeenCalled();
+
+    vi.stubEnv("ALLOW_DIRECT_LOGIN_OVER_NETWORK", "1");
+    stubHappyFetch();
+    expect((await login(makeReq({ email: "op@example.com" }))).status).toBe(200);
+  });
+
+  it("keeps the allowlist active on a localhost origin", async () => {
+    vi.stubEnv("DIRECT_LOGIN_EMAILS", "op@example.com");
+    vi.stubEnv("NEXTAUTH_URL", "http://localhost:13000");
+    stubHappyFetch();
+    expect((await login(makeReq({ email: "op@example.com" }))).status).toBe(200);
+  });
+
+  it("test emails keep working regardless of the allowlist", async () => {
+    vi.stubEnv("DIRECT_LOGIN_EMAILS", "");
+    stubHappyFetch();
+    expect((await login(makeReq({ email: "test-a@b.com" }))).status).toBe(200);
   });
 });

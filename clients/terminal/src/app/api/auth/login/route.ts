@@ -39,9 +39,23 @@ export async function POST(request: NextRequest) {
   }
   // Direct email login is a DEBUG path only — real sign-in goes through Google/Microsoft OAuth
   // (api/auth/[...nextauth]). Restrict it to test accounts so it can't be used as a password-less bypass.
-  if (!normalized.includes("test")) {
+  // DIRECT_LOGIN_EMAILS (comma-separated) additionally admits deployment-approved identities: anyone
+  // who can reach this route can sign in as a listed email, so list only identities the operator owns.
+  // The allowlist is a LOCALHOST convenience — on a deployment that declares a non-local public
+  // origin it fails closed unless ALLOW_DIRECT_LOGIN_OVER_NETWORK=1 explicitly accepts that a
+  // network-reachable route can mint tokens for the listed identities.
+  const publicOrigin = process.env.NEXTAUTH_URL || process.env.TERMINAL_URL || "";
+  const localOrigin = !publicOrigin || /^https?:\/\/(localhost|127\.0\.0\.1)([:/]|$)/i.test(publicOrigin);
+  const allowlistActive = localOrigin || process.env.ALLOW_DIRECT_LOGIN_OVER_NETWORK === "1";
+  const allowedEmails = allowlistActive
+    ? (process.env.DIRECT_LOGIN_EMAILS || "")
+        .split(",")
+        .map((s) => s.trim().toLowerCase())
+        .filter(Boolean)
+    : [];
+  if (!normalized.includes("test") && !allowedEmails.includes(normalized)) {
     return NextResponse.json(
-      { error: "Direct email login is for test accounts only — use Google or Microsoft sign-in." },
+      { error: "Direct email login is restricted to test accounts or configured operator emails — use Google or Microsoft sign-in." },
       { status: 403, headers: NO_STORE },
     );
   }

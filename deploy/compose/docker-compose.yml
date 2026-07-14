@@ -428,6 +428,13 @@ services:
       # for everyone. Identity is VERIFIED against admin-api /internal/validate over the internal-tier
       # secret (never trusted from a cookie), and the same secret fronts agent-api's admin overview.
       - VEXA_ADMIN_EMAILS=${VEXA_ADMIN_EMAILS:-}
+      # Direct email login allowlist (comma-separated) — admits these identities through the
+      # password-less debug login IN ADDITION to "test" emails. Anyone who can reach the terminal
+      # can sign in as a listed email, so list only operator-owned identities. Empty = test-only.
+      # LOCALHOST-ONLY by design: when NEXTAUTH_URL/TERMINAL_URL declares a non-local origin the
+      # allowlist fails closed unless ALLOW_DIRECT_LOGIN_OVER_NETWORK=1 opts in explicitly.
+      - DIRECT_LOGIN_EMAILS=${DIRECT_LOGIN_EMAILS:-}
+      - ALLOW_DIRECT_LOGIN_OVER_NETWORK=${ALLOW_DIRECT_LOGIN_OVER_NETWORK:-}
       - VEXA_INTERNAL_API_SECRET=${INTERNAL_API_SECRET:-vexa-internal-secret}
       # Composer mic dictation (/api/stt) — same STT service the meeting pipeline uses; token stays
       # server-side. Empty → the mic button reports "not configured" instead of failing silently.
