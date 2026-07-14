@@ -210,6 +210,7 @@ function gateSchema() {
 const SEAL_FILE = join(ROOT, "contracts.seal.json");
 const ARCH_FILE = join(ROOT, "architecture.calm.json");
 const ARCH_SEAL = join(ROOT, "architecture.seal.json");
+const SCHEMA_SEAL = join(ROOT, "schema.seal.json");  // #db-seal — frozen DB schema (tables+columns)
 // canonical hash of the chart (parsed → re-stringified, so formatting/whitespace doesn't churn the seal)
 const archHash = () => createHash("sha256").update(JSON.stringify(JSON.parse(readFileSync(ARCH_FILE, "utf8")))).digest("hex");
 function gateContractVersion() {
@@ -695,6 +696,21 @@ const CONFIG_ADOPTED = [
     scan: ["core/agent/control_plane", "core/agent/shared"],
     compose: "agent-api", helm: ["deployment-agent-api.yaml"], lite: "agent-api",
   },
+  {
+    // #526: the two services carrying today's fail-closed INTERNAL_API_SECRET guard.
+    service: "admin-api",
+    decl: "core/identity/services/admin-api/src/admin_api/config.v1.json",
+    preflight: "core/identity/services/admin-api/src/admin_api/config_preflight.py",
+    scan: ["core/identity/services/admin-api/src"],
+    compose: "admin-api", helm: ["deployment-admin-api.yaml"], lite: "admin-api",
+  },
+  {
+    service: "gateway",
+    decl: "core/gateway/services/gateway/src/gateway/config.v1.json",
+    preflight: "core/gateway/services/gateway/src/gateway/config_preflight.py",
+    scan: ["core/gateway/services/gateway/src"],
+    compose: "gateway", helm: ["deployment-gateway.yaml"], lite: "gateway",
+  },
 ];
 
 // docker-compose.yml is parsed line-wise (no YAML dep): a service block runs from `  name:` to the
@@ -811,7 +827,129 @@ function gateConfigContract() {
   return true;
 }
 
-const GATES = { readme: gateReadme, dataflow: gateDataflow, isolation: gateIsolation, "isolation-py": gateIsolationPy, exports: gateExports, graph: gateGraph, "graph-py": gateGraphPy, schema: gateSchema, "contract-version": gateContractVersion, "config-contract": gateConfigContract, python: gatePython, stack: gateStack, node: gateNode, health: gateHealth, access: gateAccess, tracing: gateTracing, replay: gateReplay, telemetry: gateTelemetry, eval: gateEval, licenses: gateLicenses, compose: gateCompose, "execution-env": gateExecutionEnv, "test-isolation": gateTestIsolation, "arch-report": gateArchReport, parity: gateParity, "compose-stress": gateComposeStress, "compose-chaos": gateComposeChaos, "eval-baseline": gateEvalBaseline, "contract-conformance": gateContractConformance };
+// gate:db-schema (#db-seal) — the DB schema is FROZEN in schema.seal.json. Any table/column add,
+// drop, or change (in admin-api's models or meeting-api's mirror) trips this gate and requires a
+// deliberate `pnpm seal:schema` re-seal — a human review step. This is the structural enforcement of
+// "no unreviewed database changes": a stray migration or model edit can no longer land silently.
+function _schemaDigest() {
+  return JSON.parse(execSync("python3 scripts/schema_digest.py", { cwd: ROOT }).toString());
+}
+
+function _flattenSchema(d) {
+  const flat = {};
+  for (const [file, tables] of Object.entries(d)) {
+    const svc = (file.match(/\/services\/([^/]+)\//) || [, file])[1];
+    for (const [t, cols] of Object.entries(tables))
+      for (const [c, def] of Object.entries(cols)) flat[`${svc}::${t}.${c}`] = def;
+  }
+  return flat;
+}
+
+function gateDbSchema() {
+  if (!existsSync(SCHEMA_SEAL)) return fail(["gate:db-schema — schema.seal.json missing (run `pnpm seal:schema` to freeze the current DB schema)"]);
+  let current;
+  try { current = _schemaDigest(); }
+  catch (e) { return fail([`gate:db-schema — could not compute the schema digest (python3 scripts/schema_digest.py):\n${(e.stdout || e.stderr || e).toString().slice(-600)}`]); }
+  const cur = _flattenSchema(current);
+  const old = _flattenSchema(JSON.parse(readFileSync(SCHEMA_SEAL, "utf8")));
+  const errs = [];
+  for (const k of Object.keys(cur)) if (!(k in old)) errs.push(`ADDED    ${k} = ${cur[k]}`);
+  for (const k of Object.keys(old)) if (!(k in cur)) errs.push(`REMOVED  ${k}`);
+  for (const k of Object.keys(cur)) if (k in old && cur[k] !== old[k]) errs.push(`CHANGED  ${k}: ${old[k]}  →  ${cur[k]}`);
+  if (errs.length) return fail([
+    "db-schema — the DB schema drifted from schema.seal.json. A deliberate change needs `pnpm seal:schema` + human review (lane:schema):",
+    ...errs.map((e) => "   " + e),
+  ]);
+  const tables = new Set(Object.keys(cur).map((k) => k.split(".")[0]));
+  console.log(`  ✓ gate:db-schema — ${Object.keys(cur).length} columns across ${tables.size} sealed table(s) match schema.seal.json`);
+  return true;
+}
+
+// gate:db-budget (#529) — the connection-budget accounting the 2026-04-21 outage lacked. Every
+// service that constructs a Postgres engine must be in deploy/db-budget.json; Σ(helm replicas ×
+// per-service pool ceiling) + reserved must fit max_connections; and no service's code may set a
+// pool_size/max_overflow HIGHER than its declared ceiling (so the budget can't silently under-count).
+function _dbHoldingServices() {
+  let out;
+  try {
+    out = execSync("grep -rl --include='*.py' create_async_engine core", { cwd: ROOT }).toString();
+  } catch { return new Set(); }  // grep exit 1 = no matches
+  const svcs = new Set();
+  for (const path of out.split("\n")) {
+    if (!path || /(^|\/)tests?\//.test(path) || path.includes("test_")) continue;
+    const m = path.match(/\/services\/([^/]+)\//);
+    if (m) svcs.add(m[1]);
+  }
+  return svcs;
+}
+
+function _explicitPool(service) {
+  // the largest explicit pool_size= / max_overflow= a service's code sets, or {} when it relies on
+  // the framework default (the "silent default" the issue names). Used to reject an under-stated budget.
+  let out = "";
+  try {
+    out = execSync(`grep -rhoE --include='*.py' '(pool_size|max_overflow) *= *[0-9]+' core 2>/dev/null | grep -v test || true`, { cwd: ROOT }).toString();
+  } catch { out = ""; }
+  const found = {};
+  for (const line of out.split("\n")) {
+    const m = line.match(/(pool_size|max_overflow)\s*=\s*(\d+)/);
+    if (m) found[m[1]] = Math.max(found[m[1]] || 0, parseInt(m[2], 10));
+  }
+  return found;  // note: repo-wide (explicit overrides are rare); a match anywhere raises the floor
+}
+
+function _helmReplicas(key) {
+  const vals = join(ROOT, "deploy", "helm", "charts", "vexa", "values.yaml");
+  if (!existsSync(vals)) return null;
+  const lines = readFileSync(vals, "utf8").split("\n");
+  const start = lines.findIndex((l) => l.replace(/\s+$/, "") === `${key}:`);
+  if (start < 0) return null;
+  for (let i = start + 1; i < lines.length; i++) {
+    if (/^[A-Za-z0-9_]+:/.test(lines[i])) break;               // next top-level key → left the block
+    const m = lines[i].match(/^\s+replicaCount:\s*(\d+)/);
+    if (m) return parseInt(m[1], 10);
+  }
+  return null;
+}
+
+function gateDbBudget() {
+  const budgetPath = join(ROOT, "deploy", "db-budget.json");
+  if (!existsSync(budgetPath)) return fail(["gate:db-budget — deploy/db-budget.json missing (the connection-budget accounting, #529)"]);
+  let budget;
+  try { budget = JSON.parse(readFileSync(budgetPath, "utf8")); }
+  catch (e) { return fail([`gate:db-budget — deploy/db-budget.json is not valid JSON — ${e.message}`]); }
+
+  const errs = [];
+  const declared = new Set(Object.keys(budget.services || {}));
+  const actual = _dbHoldingServices();
+  for (const s of actual) if (!declared.has(s)) errs.push(`'${s}' constructs a Postgres engine but is absent from db-budget.json — account for it (replicas × pool)`);
+  for (const s of declared) if (!actual.has(s)) errs.push(`db-budget lists '${s}' but no non-test source constructs a DB engine there — remove it or fix the name`);
+
+  const explicit = _explicitPool();
+  let total = Number(budget.reserved || 0);
+  const rows = [];
+  for (const [svc, cfg] of Object.entries(budget.services || {})) {
+    const replicas = _helmReplicas(cfg.helm_key);
+    if (replicas === null) { errs.push(`${svc}: could not read replicaCount for helm key '${cfg.helm_key}' in values.yaml`); continue; }
+    if (explicit.pool_size && explicit.pool_size > cfg.pool_size)
+      errs.push(`${svc}: code sets pool_size=${explicit.pool_size} but db-budget declares ${cfg.pool_size} (under-count)`);
+    if (explicit.max_overflow && explicit.max_overflow > cfg.max_overflow)
+      errs.push(`${svc}: code sets max_overflow=${explicit.max_overflow} but db-budget declares ${cfg.max_overflow} (under-count)`);
+    const ceiling = Number(cfg.pool_size || 0) + Number(cfg.max_overflow || 0);
+    const conns = replicas * ceiling;
+    total += conns;
+    rows.push(`${svc} ${replicas}×${ceiling}=${conns}`);
+  }
+  const limit = Number(budget.max_connections);
+  if (!errs.length && total > limit)
+    errs.push(`Σ ${total} connections EXCEEDS max_connections ${limit} — [${rows.join(", ")}, reserved ${budget.reserved}]. Reduce replicas/pool, raise the DB limit, or enable pgbouncer.`);
+
+  if (errs.length) return fail(["db-budget (#529, the 2026-04-21 outage shape) — connection-budget violations:", ...errs.map((e) => "   " + e)]);
+  console.log(`  ✓ gate:db-budget — Σ ${total}/${limit} connections fits [${rows.join(", ")}, reserved ${budget.reserved}]`);
+  return true;
+}
+
+const GATES = { readme: gateReadme, dataflow: gateDataflow, isolation: gateIsolation, "isolation-py": gateIsolationPy, exports: gateExports, graph: gateGraph, "graph-py": gateGraphPy, schema: gateSchema, "contract-version": gateContractVersion, "config-contract": gateConfigContract, "db-schema": gateDbSchema, "db-budget": gateDbBudget, python: gatePython, stack: gateStack, node: gateNode, health: gateHealth, access: gateAccess, tracing: gateTracing, replay: gateReplay, telemetry: gateTelemetry, eval: gateEval, licenses: gateLicenses, compose: gateCompose, "execution-env": gateExecutionEnv, "test-isolation": gateTestIsolation, "arch-report": gateArchReport, parity: gateParity, "compose-stress": gateComposeStress, "compose-chaos": gateComposeChaos, "eval-baseline": gateEvalBaseline, "contract-conformance": gateContractConformance };
 const which = process.argv[2] || "all";
 
 // `seal` (not a gate) — (re)freeze the current published contracts into contracts.seal.json.
@@ -821,6 +959,16 @@ if (which === "seal") {
   for (const d of contractVersionDirs().sort()) seal[rel(d).replace(/\\/g, "/")] = schemaHash(d);
   writeFileSync(SEAL_FILE, JSON.stringify(seal, null, 2) + "\n");
   console.log(`sealed ${Object.keys(seal).length} contract(s) → ${rel(SEAL_FILE)}`);
+  process.exit(0);
+}
+// `seal-schema` (not a gate) — freeze the current DB schema (tables+columns) into schema.seal.json.
+// Run ONLY after a deliberately-reviewed model change (the diff of schema.seal.json IS the review).
+if (which === "seal-schema") {
+  const digest = execSync("python3 scripts/schema_digest.py", { cwd: ROOT }).toString();
+  writeFileSync(SCHEMA_SEAL, digest.endsWith("\n") ? digest : digest + "\n");
+  const flat = _flattenSchema(JSON.parse(digest));
+  const tables = new Set(Object.keys(flat).map((k) => k.split(".")[0]));
+  console.log(`sealed DB schema — ${Object.keys(flat).length} columns across ${tables.size} table(s) → ${rel(SCHEMA_SEAL)}`);
   process.exit(0);
 }
 // `seal-arch` (not a gate) — stamp the chart's canonical hash as the new asserted-true baseline.
