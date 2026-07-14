@@ -6,6 +6,7 @@
  *  (AGENT: POST /api/meeting/process), returning the combined state. `send bot ≠ start copilot` — two
  *  toggles, two domains — composed into one op. Partial failure is SURFACED in the returned state, never
  *  swallowed (P18). */
+import { botName } from "../app/botName";
 import { ApiError, getJson } from "./apiClient";
 
 export interface AgentOnMeetingInput {
@@ -43,7 +44,7 @@ export async function agentOnMeeting(input: AgentOnMeetingInput): Promise<AgentO
       platform,
       native_meeting_id: native_id,
       meeting_url: meetingUrlFor(platform, native_id, input.meeting_url),
-      bot_name: input.bot_name ?? "Vexa",
+      bot_name: input.bot_name ?? botName(),
     }),
   });
   // Step 2 — AGENT domain: enable the copilot (POST /api/meeting/process). Surface a failure, don't throw.

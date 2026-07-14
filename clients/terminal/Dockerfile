@@ -32,6 +32,10 @@ ENV NEXT_PUBLIC_GA_MEASUREMENT_ID=$NEXT_PUBLIC_GA_MEASUREMENT_ID
 # agent-api paths (404). Empty (default) keeps every surface. NEXT_PUBLIC_* → set BEFORE `next build`.
 ARG NEXT_PUBLIC_TERMINAL_MODE=""
 ENV NEXT_PUBLIC_TERMINAL_MODE=$NEXT_PUBLIC_TERMINAL_MODE
+# Bot display name (src/app/botName.ts) — the participant name the notetaker joins meetings
+# with. Empty (default) keeps "Vexa". NEXT_PUBLIC_* → set BEFORE `next build`.
+ARG NEXT_PUBLIC_BOT_NAME=""
+ENV NEXT_PUBLIC_BOT_NAME=$NEXT_PUBLIC_BOT_NAME
 # Regular build (not standalone): produces .next served by the custom server in production.
 RUN npm run build
 

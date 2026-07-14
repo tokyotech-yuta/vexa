@@ -9,6 +9,7 @@
  *  with the people you're meeting → the bot auto-joins at start → notes land on the same row.
  *  Once the row leaves the intent statuses the row click routes to the live meeting tab instead. */
 import { useEffect, useMemo, useRef, useState } from "react";
+import { botName } from "../app/botName";
 import { registerTab, type TabProps } from "../contributions";
 import { useService } from "../platform";
 import { LayoutServiceId } from "../workbench/layout";
@@ -238,7 +239,7 @@ function MeetingPrepTab({ params }: TabProps) {
       const platformSlug = m.platform === "Google Meet" ? "google_meet" : m.platform.toLowerCase().replace(/\s+/g, "_");
       const r = await fetch("/api/bots", {
         method: "POST", headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ platform: platformSlug, native_meeting_id: m.native_id, ...(m.meeting_url ? { meeting_url: m.meeting_url } : {}), bot_name: "Vexa" }),
+        body: JSON.stringify({ platform: platformSlug, native_meeting_id: m.native_id, ...(m.meeting_url ? { meeting_url: m.meeting_url } : {}), bot_name: botName() }),
       });
       if (!r.ok) throw new Error((await r.text().catch(() => "")).slice(0, 180) || `${r.status}`);
       refreshMeetings();

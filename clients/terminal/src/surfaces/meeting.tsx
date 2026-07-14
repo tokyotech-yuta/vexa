@@ -6,6 +6,7 @@
 import { useEffect, useRef, useState } from "react";
 import { useService } from "../platform";
 import { LayoutServiceId, type TabDescriptor } from "../workbench/layout";
+import { botName } from "../app/botName";
 import { registerList, registerTab, registerCommand, type TabProps } from "../contributions";
 import { Icon } from "../ui-kit";
 import { ContextMenu, copyText } from "../ui-kit/ContextMenu";
@@ -325,7 +326,7 @@ export function actionsFor(m: MeetingMock): RowAction[] {
         // the row's real link when it has one (zoom/teams NEED it); gmeet can be constructed
         ...(m.meeting_url ? { meeting_url: m.meeting_url }
           : platformSlug === "google_meet" ? { meeting_url: `https://meet.google.com/${native}` } : {}),
-        bot_name: "Vexa",
+        bot_name: botName(),
       }),
     }), onFailure);
   // Delete a PLANNED row — ROW-id addressed (a link-less plan has no platform/native path).
@@ -648,7 +649,7 @@ function MeetingsList() {
       const r = await fetch("/api/bots", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ platform: parsed.platform, native_meeting_id: parsed.native_meeting_id, meeting_url: u, bot_name: "Vexa" }),
+        body: JSON.stringify({ platform: parsed.platform, native_meeting_id: parsed.native_meeting_id, meeting_url: u, bot_name: botName() }),
       });
       if (r.ok) {
         setSent("ok"); setUrl("");
