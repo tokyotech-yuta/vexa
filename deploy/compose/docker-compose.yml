@@ -403,6 +403,9 @@ services:
         # API-tokens surface load, and the server proxy refuses agent-api paths (404). Uncomment
         # (or set TERMINAL_MODE=meetings in .env) and REBUILD the terminal image to enable:
         # NEXT_PUBLIC_TERMINAL_MODE: ${TERMINAL_MODE:-meetings}
+        # Bot display name, baked at build time (NEXT_PUBLIC_* — see clients/terminal/src/app/botName.ts).
+        # Set BOT_NAME in .env, then rebuild the terminal image. Empty → "Vexa".
+        NEXT_PUBLIC_BOT_NAME: ${BOT_NAME:-}
         # Runtime node_modules flavor (clients/terminal/Dockerfile): prod (default, pruned) or
         # dev (full tree). Set TERMINAL_RUNTIME_DEPS=dev in .env on hosts that run the terminal
         # under the hot overlay's NODE_ENV=development — dev-mode Next needs the dev toolchain at

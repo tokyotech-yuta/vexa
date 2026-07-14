@@ -102,6 +102,9 @@ _PAGE = r"""<!doctype html><meta charset=utf-8><title>Vexa · control panel</tit
 </main>
 <script>
 const $=id=>document.getElementById(id);
+// Transcript/notes/cards/entities are attacker-controllable (a meeting participant's speech, an
+// entity name). Escape before it ever reaches innerHTML so a `<img onerror>` payload renders as text.
+function esc(s){return String(s==null?'':s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));}
 function tab(n,b){document.querySelectorAll('.tab').forEach(t=>t.classList.remove('on'));$(n).classList.add('on');
   document.querySelectorAll('nav button').forEach(x=>x.classList.remove('on'));b.classList.add('on');}
 async function j(u,o){const r=await fetch(u,o);return r.json();}
@@ -121,7 +124,7 @@ async function send(){const m=$('msg').value.trim();if(!m)return;$('msg').value=
   ph.textContent=d.reply||('[err] '+(d.error||''));$('log').scrollTop=1e9;}
 
 // WORKSPACE
-async function browse(){const d=await j('/browse');$('ents').innerHTML=(d.entities||[]).map(p=>`<div class=ent onclick="readf('${p}')">${p}</div>`).join('')||'<i class=mut>none yet — onboard first</i>';}
+async function browse(){const d=await j('/browse');$('ents').innerHTML=(d.entities||[]).map(p=>`<div class=ent data-path="${esc(p)}" onclick="readf(this.dataset.path)">${esc(p)}</div>`).join('')||'<i class=mut>none yet — onboard first</i>';}
 async function readf(p){const d=await j('/readfile?path='+encodeURIComponent(p));$('filebody').textContent=d.content||d.error||'(empty)';}
 
 // MEETING
@@ -130,7 +133,7 @@ async function sendbot(){const u=$('url').value.trim();if(!u)return;const n=nati
   const d=await j('/sendbot?url='+encodeURIComponent(u)+'&native='+encodeURIComponent(n));
   $('mstatus').textContent=d.ok?('bot live on '+n+' — watching'):('err: '+d.error);
   if(timer)clearInterval(timer);poll(n);timer=setInterval(()=>poll(n),4000);}
-function dot(ok,label,detail){const c=ok?'#2a6':'#e0533a';return `<span title="${(detail||'').replace(/"/g,'')}"><span style="color:${c}">●</span> ${label}</span>`;}
+function dot(ok,label,detail){const c=ok?'#2a6':'#e0533a';return `<span title="${esc(detail)}"><span style="color:${c}">●</span> ${esc(label)}</span>`;}
 async function pipeline(d){  // P18: light each hop; the stuck one goes red with the typed reason
   let h={}; try{h=await j('/relay')}catch(e){}
   const ing=h.ingest||{}, nr=h.native_resolve||{};
@@ -142,15 +145,15 @@ async function pipeline(d){  // P18: light each hop; the stuck one goes red with
     dot(relayOk,'relaying', relayOk?'ok':((nr.kind||'')+': '+(nr.detail||''))),
     dot(hasOut,'copilot', hasOut?'notes+cards':'waiting'),
   ];
-  $('pipeline').innerHTML = els.join('') + (relayOk?'':` <span style="color:#e0533a">— ${nr.detail||'relay stalled'}</span>`);
+  $('pipeline').innerHTML = els.join('') + (relayOk?'':` <span style="color:#e0533a">— ${esc(nr.detail||'relay stalled')}</span>`);
 }
 async function poll(n){const d=await j('/snapshot?native='+encodeURIComponent(n));$('counts').textContent=JSON.stringify(d.counts||{});
-  $('notes').innerHTML=(d.notes||[]).map(x=>`<div class=note><span class=spk>${x.speaker||''}</span> ${x.text||''}</div>`).join('')||'<i>waiting…</i>';
-  $('cards').innerHTML=(d.cards||[]).map(c=>`<div class=card><span class=kind>${c.kind||''}</span><b>${c.title||''}</b><br>${c.body||''}</div>`).join('')||'<i>waiting…</i>';
+  $('notes').innerHTML=(d.notes||[]).map(x=>`<div class=note><span class=spk>${esc(x.speaker)}</span> ${esc(x.text)}</div>`).join('')||'<i>waiting…</i>';
+  $('cards').innerHTML=(d.cards||[]).map(c=>`<div class=card><span class=kind>${esc(c.kind)}</span><b>${esc(c.title)}</b><br>${esc(c.body)}</div>`).join('')||'<i>waiting…</i>';
   pipeline(d);}
 
 // ROUTINES
-async function routines(){const d=await j('/routines');$('rlist').innerHTML=(d.routines||[]).map(r=>`<div class=note><b>${r.name}</b> · <span class=mut>${r.cron}</span> · job=${r.job_id||''} · ${r.enabled?'on':'off'}</div>`).join('')||'<i class=mut>none</i>';}
+async function routines(){const d=await j('/routines');$('rlist').innerHTML=(d.routines||[]).map(r=>`<div class=note><b>${esc(r.name)}</b> · <span class=mut>${esc(r.cron)}</span> · job=${esc(r.job_id)} · ${r.enabled?'on':'off'}</div>`).join('')||'<i class=mut>none</i>';}
 async function addroutine(){const d=await j('/routine_add?name='+encodeURIComponent($('rname').value)+'&cron='+encodeURIComponent($('rcron').value)+'&prompt='+encodeURIComponent($('rprompt').value));routines();}
 </script>
 """
