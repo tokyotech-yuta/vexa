@@ -66,7 +66,7 @@ env:
 			echo "Seeding $(ENV_FILE) from deploy/compose/.env"; cp "$(ROOT)/deploy/compose/.env" "$(ENV_FILE)"; \
 		else \
 			echo "Creating minimal $(ENV_FILE) (edit TRANSCRIPTION_SERVICE_* for transcripts)"; \
-			printf 'ADMIN_TOKEN=changeme\nTRANSCRIPTION_SERVICE_URL=\nTRANSCRIPTION_SERVICE_TOKEN=\nIMAGE_TAG=latest\n' > "$(ENV_FILE)"; \
+			printf 'ADMIN_TOKEN=changeme\nTRANSCRIPTION_SERVICE_URL=\nTRANSCRIPTION_SERVICE_TOKEN=\nIMAGE_TAG=v012\n' > "$(ENV_FILE)"; \
 		fi; \
 	fi
 
@@ -76,14 +76,31 @@ preflight:
 
 ## up — a bridge network, postgres + minio sidecars (by name), then the all-in-one container with
 ## only the front doors published. Internal services live on the container's own loopback.
+##
+## The recipe is ONE `\`-continued shell command: a bare `#` line inside it (no trailing `\`) ends
+## the continuation, so make runs the rest in a SEPARATE shell where IMG/ADMIN_TK/… are already
+## lost — which once shipped `docker run … $IMG` with an EMPTY image (vexa-lite never created,
+## every front door down). Keep all commentary OUT of the recipe body; annotate here instead.
+##
+## Claude-credential automount (C2/#502): if the host has ~/.claude/.credentials.json, mount it and
+## point HOST_CLAUDE_CREDENTIALS at the IN-CONTAINER path — in LITE the process backend reads the
+## file directly. (Compose is the opposite: there the var is a docker-HOST path the compose file
+## mounts. Don't copy the semantics across.)
 up: preflight
 	@set -e; \
 	docker network inspect $(NETWORK) >/dev/null 2>&1 || docker network create $(NETWORK) >/dev/null; \
 	ADMIN_TK=$$(grep -E '^ADMIN_TOKEN=' $(ENV_FILE) 2>/dev/null | cut -d= -f2-); ADMIN_TK=$${ADMIN_TK:-changeme}; \
 	TX_URL=$$(grep -E '^TRANSCRIPTION_SERVICE_URL=' $(ENV_FILE) 2>/dev/null | cut -d= -f2-); \
 	TX_TOKEN=$$(grep -E '^TRANSCRIPTION_SERVICE_TOKEN=' $(ENV_FILE) 2>/dev/null | cut -d= -f2-); \
-	IMAGE_TAG=$$(grep -E '^IMAGE_TAG=' $(ENV_FILE) 2>/dev/null | cut -d= -f2-); IMAGE_TAG=$${IMAGE_TAG:-latest}; \
+	IMAGE_TAG=$$(grep -E '^IMAGE_TAG=' $(ENV_FILE) 2>/dev/null | cut -d= -f2-); IMAGE_TAG=$${IMAGE_TAG:-v012}; \
 	IMG=$$(docker image inspect $(LOCAL_TAG) >/dev/null 2>&1 && echo $(LOCAL_TAG) || echo $(DOCKERHUB_USER)/$(IMAGE_NAME):$$IMAGE_TAG); \
+	CLAUDE_CREDS="$$HOME/.claude/.credentials.json"; \
+	if [ -f "$$CLAUDE_CREDS" ]; then \
+		echo "  Detected Claude subscription credentials — mounting into container"; \
+		CLAUDE_MOUNT="-v $$CLAUDE_CREDS:/var/lib/vexa/host-claude-credentials:ro -e HOST_CLAUDE_CREDENTIALS=/var/lib/vexa/host-claude-credentials"; \
+	else \
+		CLAUDE_MOUNT=""; \
+	fi; \
 	echo "Starting PostgreSQL ($(PG_CONTAINER))..."; \
 	if ! docker ps -q -f name=$(PG_CONTAINER) | grep -q .; then \
 		docker rm -f $(PG_CONTAINER) 2>/dev/null || true; \
@@ -117,6 +134,7 @@ up: preflight
 		-e MINIO_SECRET_KEY=$(MINIO_SECRET_KEY) -e MINIO_BUCKET=$(MINIO_BUCKET) -e MINIO_SECURE=false \
 		-e VEXA_PUBLIC_API_URL=http://localhost:$(HOST_GATEWAY_PORT) \
 		-e TERMINAL_PUBLIC_URL=http://localhost:$(HOST_TERMINAL_PORT) \
+		$$CLAUDE_MOUNT \
 		$$IMG > /dev/null; \
 	echo "  Waiting for the gateway (up to 3 min)..."; \
 	for i in $$(seq 1 36); do curl -sf -o /dev/null http://localhost:$(HOST_GATEWAY_PORT)/health 2>/dev/null && break; sleep 5; done; \

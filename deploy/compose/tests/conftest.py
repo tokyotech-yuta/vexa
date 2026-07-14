@@ -84,11 +84,30 @@ def docker_available() -> bool:
 requires_docker = pytest.mark.skipif(not docker_available(), reason="docker not available")
 
 
+# Registry-side 5xx (Docker Hub blips) are the one failure class where a blind retry is CORRECT:
+# the command never exercised our code, so retrying cannot mask a product bug. Everything else
+# still fails on the first attempt. (A registry 502 pulling redis:7-alpine killed an
+# otherwise-green pr-value run.)
+_REGISTRY_FLAKE = ("registry-1.docker.io", "Bad Gateway", "Service Unavailable", "TLS handshake timeout")
+
+
+# Optional overlay files (colon-separated paths), e.g. the CI build-cache overlay — appended
+# after the base file so they can only ADD build options, never redefine the stack.
+COMPOSE_EXTRA_FILES = [f for f in os.getenv("COMPOSE_EXTRA_FILES", "").split(":") if f]
+
+
 def _compose(*args: str, env: dict | None = None, check: bool = True, timeout: int = 1200) -> subprocess.CompletedProcess:
     base = ["docker", "compose", "-p", PROJECT, "-f", str(COMPOSE_FILE)]
+    for extra in COMPOSE_EXTRA_FILES:
+        base += ["-f", extra]
     full_env = {**os.environ, **_stack_env(), **(env or {})}
     cmd = base + list(args)
     result = subprocess.run(cmd, capture_output=True, text=True, env=full_env, check=False, timeout=timeout)
+    if result.returncode != 0:
+        blob = (result.stdout or "") + (result.stderr or "")
+        if any(sig in blob for sig in _REGISTRY_FLAKE):
+            time.sleep(20)  # one retry, registry flakes only — see _REGISTRY_FLAKE above
+            result = subprocess.run(cmd, capture_output=True, text=True, env=full_env, check=False, timeout=timeout)
     if check and result.returncode != 0:
         stdout = (result.stdout or "")[-4000:]
         stderr = (result.stderr or "")[-4000:]
