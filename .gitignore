@@ -28,3 +28,6 @@ docs/views/*
 
 # transcription service downloaded model weights (runtime cache)
 deploy/transcription/models/
+
+# Personal knowledge graph — private data, lives in its own private repo (tokyotech-yuta/yuta-kg)
+kg/
