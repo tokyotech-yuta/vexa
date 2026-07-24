@@ -15,7 +15,7 @@ import {
 } from '@vexa/join';
 import type { BotStatus } from './contracts.js';
 import type { Invocation } from './config.js';
-import type { JoinDriver, JoinOutcome } from './ports.js';
+import type { JoinDriver, JoinOutcome, JoinResult } from './ports.js';
 
 /**
  * Map @vexa/join's typed AdmissionError `outcome` → a JoinOutcome (G1).
@@ -25,15 +25,18 @@ import type { JoinDriver, JoinOutcome } from './ports.js';
  * (`lifecycle/retry.py`) RE-SPAWNS a bot that was actually DENIED, burning quota. Mapping the outcome
  * keeps the truth: a `denial` → `rejected` → `awaiting_admission_rejected` (PERMANENT, no retry); a
  * `lobby_timeout` → `timeout` → `awaiting_admission_timeout` (transient, a legit retry); a `join_failure`
- * stays `error` → `join_failure` (transient). NB: a distinct `blocked` reason needs a sealed-contract
+ * stays `error` → `join_failure` (transient); an `auth_session_missing` (signed-out profile in
+ * authenticated mode) → `auth_missing` → `auth_session_missing` (PERMANENT — a re-spawn against a dead
+ * profile can never succeed). NB: a distinct `blocked` reason needs a sealed-contract
  * `CompletionReason` value (lane:contract) — until then a detected block surfaces via this same path.
  */
 export function admissionOutcomeToJoinOutcome(outcome: AdmissionOutcome): JoinOutcome {
   switch (outcome) {
-    case 'denial':        return 'rejected';
-    case 'lobby_timeout': return 'timeout';
-    case 'join_failure':  return 'error';
-    default:              return 'error';
+    case 'denial':               return 'rejected';
+    case 'lobby_timeout':        return 'timeout';
+    case 'auth_session_missing': return 'auth_missing';
+    case 'join_failure':         return 'error';
+    default:                     return 'error';
   }
 }
 
@@ -56,7 +59,7 @@ function joinPlatform(p: string): JoinPlatform {
 export function createBrowserJoinDriver(page: Page, inv: Invocation): JoinDriver {
   const platform = joinPlatform(inv.platform);
   return {
-    async join(report): Promise<JoinOutcome> {
+    async join(report): Promise<JoinResult> {
       let r;
       try {
         r = await joinMeeting(page, {
@@ -70,14 +73,18 @@ export function createBrowserJoinDriver(page: Page, inv: Invocation): JoinDriver
         });
       } catch (e) {
         // A TYPED admission verdict (denial/lobby_timeout/join_failure) → map its outcome so the
-        // control plane records the truth, not a generic retried `join_failure` (G1). A genuinely
-        // unexpected throw (browser crash, navigation error) is NOT an AdmissionError → re-raise so
-        // the orchestrator classifies it as a transient join_failure.
-        if (e instanceof AdmissionError) return admissionOutcomeToJoinOutcome(e.outcome);
+        // control plane records the truth, not a generic retried `join_failure` (G1). CARRY the
+        // AdmissionError's own message as the reason text (#926) — that's the real Zoom cause
+        // ("auth_required: …", "host did not start …") the terminal lifecycle row would otherwise
+        // lose, leaving meeting-api to synthesize "reason: None". A genuinely unexpected throw
+        // (browser crash, navigation error) is NOT an AdmissionError → re-raise so the orchestrator
+        // classifies it as a transient join_failure (and stamps `reason: String(e)` itself).
+        if (e instanceof AdmissionError) return { outcome: admissionOutcomeToJoinOutcome(e.outcome), reason: e.message };
         throw e;
       }
-      if (r.admitted) { await report('active'); return 'admitted'; }
-      return (r.state === 'blocked' || r.state === 'needs_human_help') ? 'blocked' : 'rejected';
+      if (r.admitted) { await report('active'); return { outcome: 'admitted' }; }
+      const outcome: JoinOutcome = (r.state === 'blocked' || r.state === 'needs_human_help') ? 'blocked' : 'rejected';
+      return { outcome, reason: `join ended in state '${r.state}' without admission` };
     },
     onRemoval(cb) {
       if (platform === 'teams') return startTeamsRemovalMonitor(page, cb);
@@ -95,8 +102,8 @@ export function createBrowserJoinDriver(page: Page, inv: Invocation): JoinDriver
       // Bug 2 — cancel a PENDING join from the waiting room / pre-join screen. Two-step, both
       // best-effort:
       //  1. Click the platform's cancel/leave affordance. The stateless leave-click helpers already
-      //     include the waiting-room selectors: Teams' teamsLeaveSelectors carry the "Cancel" buttons
-      //     "(for awaiting admission/waiting room)", and googleLeaveSelectors include Cancel/Close. On
+      //     include the waiting-room selectors: Teams' teamsLeaveButtonMatchers carry the "Cancel" buttons
+      //     "(for awaiting admission/waiting room)", and googleLeaveButtonMatchers include Cancel/Close. On
       //     Zoom the web client shows no reliable pre-admit cancel, so step 2 is the withdraw there.
       //  2. GUARANTEED DROP: close the page. Google Meet's lobby often exposes no clickable Cancel
       //     (just "Asking to join…"), so closing the tab is the reliable way to abandon the request;

@@ -19,12 +19,36 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import os
 import secrets
 from datetime import datetime, timezone
 from typing import Optional
 
 from .ports import RedisBus, TranscriptStore
+
+log = logging.getLogger("meeting_api.collector.adapters")
+
+
+def _decode_claimed(resp) -> "list[tuple[str, dict]]":
+    """Normalize an XAUTOCLAIM response to ``[(message_id, fields), ...]`` (#636).
+
+    redis-py returns ``[cursor, claimed]`` (older) or ``[cursor, claimed, deleted]`` (Redis 7+),
+    where ``claimed`` is ``[(id, {field: value}), ...]``. Ids/keys/values are decoded from bytes so
+    the drained fields match ``read_segments``' shape (``ingest`` reads ``fields['payload']``)."""
+    if not resp or len(resp) < 2:
+        return []
+    claimed = resp[1] or []
+    out: list[tuple[str, dict]] = []
+    for message_id, fields in claimed:
+        mid = message_id.decode() if isinstance(message_id, bytes) else message_id
+        decoded = {
+            (k.decode() if isinstance(k, bytes) else k):
+            (v.decode() if isinstance(v, bytes) else v)
+            for k, v in (fields or {}).items()
+        }
+        out.append((mid, decoded))
+    return out
 
 
 def _sha(s: str) -> str:
@@ -33,6 +57,16 @@ def _sha(s: str) -> str:
 
 def _now() -> datetime:
     return datetime.now(timezone.utc)
+
+
+def _iso_utc(dt) -> Optional[str]:
+    """UTC ISO-8601 (``…Z``) for a naive-or-aware datetime. The meeting time columns are naive but
+    hold UTC (the DB session is UTC); a bare ``isoformat()`` is zone-less, so a browser's ``new Date()``
+    parses it as LOCAL and renders it offset by the viewer's UTC offset. Stamping UTC fixes that."""
+    if dt is None:
+        return None
+    aware = dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+    return aware.isoformat().replace("+00:00", "Z")
 
 
 def _expired(iso: Optional[str]) -> bool:
@@ -176,11 +210,11 @@ def _fill_absolute_times(segments: list, base) -> None:
         except (TypeError, ValueError):
             continue
         if st >= _EPOCH_THRESHOLD_S:
-            s["absolute_start_time"] = datetime.fromtimestamp(st, timezone.utc).isoformat()
-            s["absolute_end_time"] = datetime.fromtimestamp(en, timezone.utc).isoformat()
+            s["absolute_start_time"] = _iso_utc(datetime.fromtimestamp(st, timezone.utc))
+            s["absolute_end_time"] = _iso_utc(datetime.fromtimestamp(en, timezone.utc))
         elif base is not None:
-            s["absolute_start_time"] = (base + timedelta(seconds=st)).isoformat()
-            s["absolute_end_time"] = (base + timedelta(seconds=en)).isoformat()
+            s["absolute_start_time"] = _iso_utc(base + timedelta(seconds=st))
+            s["absolute_end_time"] = _iso_utc(base + timedelta(seconds=en))
 
 
 def _segment_to_api(seg: dict) -> dict:
@@ -326,8 +360,8 @@ class SqlAlchemyTranscriptStore:
             "native_meeting_id": snap["platform_specific_id"],
             "constructed_meeting_url": (data.get("constructed_meeting_url")),
             "status": snap["status"],
-            "start_time": snap["start_time"].isoformat() if snap["start_time"] else None,
-            "end_time": snap["end_time"].isoformat() if snap["end_time"] else None,
+            "start_time": _iso_utc(snap["start_time"]),
+            "end_time": _iso_utc(snap["end_time"]),
             "recordings": data.get("recordings", []),
             "notes": data.get("notes"),
             "data": data,
@@ -385,34 +419,91 @@ class SqlAlchemyTranscriptStore:
         # Session closed (transaction ended, connection returned to pool) BEFORE the Redis merge (#508).
         return await self._merge_live_segments(pg)
 
-    async def list_meetings(self, user_id, *, status=None, platform=None, limit=None, offset=None, member_workspaces=None):
-        from sqlalchemy import cast, func, or_, select
+    async def list_meetings(self, user_id, *, status=None, platform=None, limit=None, offset=None,
+                            member_workspaces=None, list_view=False, meeting_id=None, slim=False):
+        from sqlalchemy import cast, func, select, union_all
         from sqlalchemy.dialects.postgresql import JSONB
 
         from .models import Meeting
+        from .projection import DEFAULT_LIST_LIMIT, project_list_data
 
         async with self._session_factory() as db:
             # ACCESS = owner OR transcript-share viewer OR member of the bound workspace. Shared meetings
             # (owned by someone else) surface in the caller's list so a share recipient can find + open them.
+            #
+            # #800: the branches are UNIONed, never OR-ed. A single `WHERE a OR b` plans as a backward
+            # walk of the created_at index with the OR as a Filter — for a caller with few/old meetings
+            # that scans most of the table (100s+ per call under production load). Each branch below is
+            # independently index-scannable (owner → ix_meeting_user_created_at, viewer →
+            # ix_meeting_transcript_viewers_gin, workspace → ix_meeting_workspace_created_at) with its
+            # own top-N ORDER BY/LIMIT; the outer query dedups the merged ids and re-orders.
             access = [
                 Meeting.user_id == user_id,
                 cast(Meeting.data["transcript_viewers"], JSONB).op("@>")(func.to_jsonb(user_id)),
             ]
             if member_workspaces:
                 access.append(Meeting.data["workspace_id"].astext.in_(list(member_workspaces)))
-            stmt = select(Meeting).where(or_(*access))
-            if status:
-                stmt = stmt.where(Meeting.status == status)
-            if platform:
-                stmt = stmt.where(Meeting.platform == platform)
-            stmt = stmt.order_by(Meeting.created_at.desc())
-            if limit:
-                stmt = stmt.limit(limit)
-            if offset:
-                stmt = stmt.offset(offset)
-            rows = (await db.execute(stmt)).scalars().all()
-            return [
-                {
+
+            if list_view:
+                fetch_bound = (offset or 0) + (limit if limit is not None else DEFAULT_LIST_LIMIT) + 1
+            else:
+                fetch_bound = ((offset or 0) + limit) if limit else None
+
+            def _branch(cond):
+                s = select(Meeting.id).where(cond)
+                if status:
+                    # A sequence selects a SET of statuses in SQL (`/bots/status` wants the five
+                    # non-terminal ones). Filtering here instead of in Python is the difference
+                    # between reading a caller's handful of live meetings and reading their entire
+                    # history — see the `slim=` note below (#803).
+                    s = s.where(
+                        Meeting.status.in_(tuple(status))
+                        if isinstance(status, (list, tuple, set, frozenset))
+                        else Meeting.status == status
+                    )
+                if meeting_id is not None:
+                    # Detail-by-id: constrain in SQL rather than enumerating the account and
+                    # filtering in Python. The access union still decides WHETHER the caller may
+                    # see it, so ownership/share semantics are unchanged.
+                    s = s.where(Meeting.id == meeting_id)
+                if platform:
+                    s = s.where(Meeting.platform == platform)
+                if fetch_bound is not None:
+                    # ORDER BY inside a compound member is only meaningful (and only kept by
+                    # the compiler) together with LIMIT; an unbounded branch returns its full
+                    # set, so the outer ORDER BY alone decides.
+                    s = s.order_by(Meeting.created_at.desc()).limit(fetch_bound)
+                return s
+
+            ids = union_all(*[_branch(c) for c in access]).subquery()
+            stmt = (
+                select(Meeting)
+                .where(Meeting.id.in_(select(ids.c.id)))
+                .order_by(Meeting.created_at.desc())
+            )
+            if list_view:
+                # #584: the paginated, slim list-view path (GET /bots, GET /meetings). Bound the response
+                # with a default page size (an explicit `limit` still wins) and over-fetch one row past
+                # the page to compute `has_more` without a second COUNT query.
+                effective_limit = limit if limit is not None else DEFAULT_LIST_LIMIT
+                if offset:
+                    stmt = stmt.offset(offset)
+                stmt = stmt.limit(effective_limit + 1)
+                rows = (await db.execute(stmt)).scalars().all()
+                has_more = len(rows) > effective_limit
+                rows = rows[:effective_limit]
+            else:
+                # Internal enumeration (get-by-id filter, /bots/status, calendar sync): unchanged —
+                # explicit `limit` only, NO default cap, full `data` retained below.
+                if limit:
+                    stmt = stmt.limit(limit)
+                if offset:
+                    stmt = stmt.offset(offset)
+                rows = (await db.execute(stmt)).scalars().all()
+                has_more = False
+
+            def _row(m):
+                row = {
                     "id": m.id,
                     "user_id": m.user_id,
                     "platform": m.platform,
@@ -421,15 +512,31 @@ class SqlAlchemyTranscriptStore:
                     if isinstance(m.data, dict) else None,
                     "status": m.status,
                     "bot_container_id": m.bot_container_id,
-                    "start_time": m.start_time.isoformat() if m.start_time else None,
-                    "end_time": m.end_time.isoformat() if m.end_time else None,
-                    "data": m.data if isinstance(m.data, dict) else {},
+                    "start_time": _iso_utc(m.start_time),
+                    "end_time": _iso_utc(m.end_time),
+                    # api.v1 MeetingResponse declares these at top level; the values live in `data`
+                    # (hoisted the same way as `_meeting_projection_from_row` in app.py).
+                    "completion_reason": (m.data or {}).get("completion_reason") if isinstance(m.data, dict) else None,
+                    "failure_stage": (m.data or {}).get("failure_stage") if isinstance(m.data, dict) else None,
                     "shared": m.user_id != user_id,   # surfaced via a share/membership, not owned by the caller
-                    "created_at": m.created_at.isoformat() if m.created_at else None,
-                    "updated_at": m.updated_at.isoformat() if m.updated_at else None,
+                    "created_at": _iso_utc(m.created_at),
+                    "updated_at": _iso_utc(m.updated_at),
+                    # #584: the LIST drops the heavy detail keys (speaker_events/bot_logs/recordings/… —
+                    # the 4.6 MB / event-loop-wedge cause) but keeps the light metadata it renders
+                    # (title/docs/flags).
+                    # #803: `slim` extends the SAME projection to a non-list caller that renders none
+                    # of the heavy keys either. `/bots/status` powers a running-bots badge, yet it
+                    # materialized every byte of `data` — 180 MB for one production account, 144 MB of
+                    # it `bot_logs` that no endpoint renders. Four concurrent polls demanded ~740 MB
+                    # transiently and OOM-killed the pod. Only callers that genuinely need full `data`
+                    # (the detail view, calendar sync, reconciliation) leave both flags off.
+                    "data": project_list_data(m.data) if (list_view or slim)
+                    else (m.data if isinstance(m.data, dict) else {}),
                 }
-                for m in rows
-            ]
+                return row
+
+            result = [_row(m) for m in rows]
+            return (result, has_more) if list_view else result
 
     async def authorize_subscribe(self, user_id, platform, native_meeting_id, member_workspaces=None) -> Optional[int]:
         """Authorize a live-transcript subscribe → the meeting ROW id, or None. TWO branches:
@@ -772,12 +879,12 @@ class SqlAlchemyTranscriptStore:
             if isinstance(m.data, dict) else None,
             "status": m.status,
             "bot_container_id": m.bot_container_id,
-            "start_time": m.start_time.isoformat() if m.start_time else None,
-            "end_time": m.end_time.isoformat() if m.end_time else None,
+            "start_time": _iso_utc(m.start_time),
+            "end_time": _iso_utc(m.end_time),
             "data": m.data if isinstance(m.data, dict) else {},
             "shared": False,
-            "created_at": m.created_at.isoformat() if m.created_at else None,
-            "updated_at": m.updated_at.isoformat() if m.updated_at else None,
+            "created_at": _iso_utc(m.created_at),
+            "updated_at": _iso_utc(m.updated_at),
         }
 
     async def create_planned_meeting(self, user_id, *, platform, native_meeting_id,
@@ -954,6 +1061,8 @@ class RedisStreamBus:
 
     def __init__(self, client):
         self._client = client
+        self._reclaim_unsupported = False  # #636: log-once latch when the Redis lacks XAUTOCLAIM
+        self._prune_unsupported = False  # #660: log-once latch when the Redis lacks XINFO CONSUMERS
 
     async def read_segments(self, *, group, consumer, stream, count=10):
         try:
@@ -974,6 +1083,82 @@ class RedisStreamBus:
                 }
                 out.append((mid, decoded))
         return out
+
+    async def reclaim_orphans(self, *, group, stream, consumer, min_idle_ms, count=10):
+        """#636: XAUTOCLAIM idle (crashed-replica) entries from the group's PEL into ``consumer``.
+        Bounded (single call, ``count`` cap) — the returned cursor lets the next tick continue.
+
+        XAUTOCLAIM needs **Redis >= 6.2**. On an older server (e.g. Redis 6.0, which the Lite image
+        bundled — the #636 regression the v0.12.5 witness caught) the command is unknown; rather than
+        crash the segment-consumer loop every tick, degrade to a **no-op** (return no reclaimed
+        entries). The normal consume path (XREADGROUP) is unaffected; only cross-replica orphan
+        recovery is unavailable until Redis is upgraded. Logged once."""
+        from redis.exceptions import ResponseError
+
+        try:
+            await self._client.xgroup_create(name=stream, groupname=group, id="0", mkstream=True)
+        except Exception:
+            pass  # BUSYGROUP — group already exists
+        try:
+            resp = await self._client.xautoclaim(
+                name=stream, groupname=group, consumername=consumer,
+                min_idle_time=min_idle_ms, start_id="0-0", count=count,
+            )
+        except ResponseError as e:
+            msg = str(e).lower()
+            if "unknown command" in msg or "xautoclaim" in msg:
+                if not self._reclaim_unsupported:
+                    self._reclaim_unsupported = True
+                    log.warning(
+                        "XAUTOCLAIM unsupported on this Redis (needs >= 6.2) — #636 orphan reclaim "
+                        "disabled; normal segment consumption is unaffected. Upgrade Redis to re-enable."
+                    )
+                return []
+            raise
+        return _decode_claimed(resp)
+
+    async def list_consumers(self, *, group, stream):
+        """#660: XINFO CONSUMERS → ``[{"name", "pending", "idle"}, ...]`` (idle in ms), the seam the
+        reclaim sweep uses to find abandoned per-recreate ghost consumers.
+
+        Degrades to ``[]`` on a Redis that rejects the command (NOGROUP before the group exists, or an
+        ``unknown command`` on a server without XINFO CONSUMERS) — the SAME no-op-on-unsupported
+        contract ``reclaim_orphans`` uses for XAUTOCLAIM, so consumer-pruning being unavailable never
+        breaks the normal XREADGROUP consume path. Logged once."""
+        from redis.exceptions import ResponseError
+
+        try:
+            resp = await self._client.xinfo_consumers(stream, group)
+        except ResponseError as e:
+            msg = str(e).lower()
+            if "unknown command" in msg or "xinfo" in msg:
+                if not self._prune_unsupported:
+                    self._prune_unsupported = True
+                    log.warning(
+                        "XINFO CONSUMERS unsupported on this Redis — #660 ghost-consumer prune "
+                        "disabled; normal segment consumption is unaffected. Upgrade Redis to re-enable."
+                    )
+                return []
+            if "nogroup" in msg:
+                return []  # group not created yet — nothing to prune
+            raise
+        out: list[dict] = []
+        for entry in resp or []:
+            info = {
+                (k.decode() if isinstance(k, bytes) else k): v
+                for k, v in entry.items()
+            }
+            name = info.get("name")
+            out.append({
+                "name": name.decode() if isinstance(name, bytes) else name,
+                "pending": int(info.get("pending") or 0),
+                "idle": int(info.get("idle") or 0),
+            })
+        return out
+
+    async def delete_consumer(self, *, group, stream, consumer):
+        """#660: XGROUP DELCONSUMER — returns the pending count the consumer held (0 for a ghost)."""
+        return await self._client.xgroup_delconsumer(stream, group, consumer)
 
     async def ack(self, *, group, stream, message_ids):
         if message_ids:
@@ -999,8 +1184,9 @@ def build_production_app(
     without those runtime deps installed in the gate venv.
     """
     import redis.asyncio as aioredis
-    from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
+    from sqlalchemy.ext.asyncio import async_sessionmaker
 
+    from ..db import build_engine
     from .app import create_app
 
     database_url = database_url or os.getenv(
@@ -1008,7 +1194,7 @@ def build_production_app(
     )
     redis_url = redis_url or os.getenv("REDIS_URL", "redis://redis:6379/0")
 
-    engine = create_async_engine(database_url, pool_pre_ping=True)
+    engine = build_engine(database_url)  # #635: env-steered pool
     session_factory = async_sessionmaker(engine, expire_on_commit=False)
     # #528: hardened Redis client (see meeting_api/__main__.py) — bounded timeouts + keepalive +
     # health checks so a Redis blip self-heals within socket_timeout instead of hanging the consumer.

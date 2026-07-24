@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import asyncio
 import time
+from collections import deque
 from typing import Optional
 
 from fastapi import FastAPI, Request
@@ -40,25 +41,77 @@ from .collector.ports import RedisBus, TranscriptStore
 from .lifecycle.machine import LifecycleSink, MeetingStore
 from .obs import TraceMiddleware
 
+#: In-process capture of the last N emitted webhook envelopes — an eval/introspection seam, never a
+#: durable store (the DB meeting row is the durable record; the WebhookSink is the delivery path).
+#: BOUNDED because it lives on the production app and every bot lifecycle callback appends one
+#: envelope that embeds the meeting's ``data`` projection; an unbounded list grew RSS monotonically
+#: under production callback traffic while idle staging (no callbacks) stayed flat (#803). A ring
+#: buffer keeps the recent-envelope semantics every reader relies on (``[-1]``, ``len``, iteration)
+#: while capping retention.
+_ENVELOPE_LOG_CAP = 256
+
+
+def _xpending_total(summary) -> "Optional[int]":
+    """Total DELIVERED-but-un-acked count for the group from an XPENDING SUMMARY reply (#636).
+    redis-py returns a dict ``{'pending': N, 'min', 'max', 'consumers'}``; the raw protocol reply is
+    a list ``[N, min, max, consumers]``. Returns the integer total, or None when unrecognizable."""
+    if isinstance(summary, dict):
+        v = summary.get("pending")
+        return int(v) if isinstance(v, int) else None
+    if isinstance(summary, (list, tuple)) and summary:
+        try:
+            return int(summary[0])
+        except (TypeError, ValueError):
+            return None
+    return None
+
 
 async def _pipeline_health(app) -> "tuple[dict, bool]":
-    """#527: derive pipeline liveness from the per-loop heartbeats + collector-group lag, and decide
-    whether to DEGRADE. A loop hung inside an await stops stamping, so its tick_age_s climbs past
-    PIPELINE_TICK_STALE_S even while the process and the live-WS path look healthy — exactly the
-    2026-04-26 silent hang. Returns ``({loops, consumer_lag}, degraded)``.
+    """#527/#636: derive pipeline liveness from the per-loop heartbeats + collector-group lag +
+    pending-entry (PEL) depth, and decide whether to DEGRADE. A loop hung inside an await stops
+    stamping, so its tick_age_s climbs past PIPELINE_TICK_STALE_S even while the process and the
+    live-WS path look healthy — the 2026-04-26 silent hang. A crashed replica's delivered-but-un-acked
+    batch is NOT lag (it was delivered) and NOT a stale heartbeat on the survivor, so #636 surfaces it
+    as ``pending_depth``. Returns ``({loops, redis_reachable, consumer_lag, pending_depth}, degraded)``.
 
-    The probe MUST NOT itself hang (that would defeat the point): the XINFO call is bounded by a 2s
-    wait_for and any failure degrades to ``consumer_lag: "unavailable"`` rather than blocking."""
+    #809 — Redis is a CACHE/QUEUE dependency, not the process's spine: an unreachable Redis is
+    reported HONESTLY as ``redis_reachable: false`` but NEVER flips ``degraded`` (so it cannot 503 the
+    shared probe). DB-backed reads keep serving through a Redis outage, so readiness stays true — a
+    cache blip no longer becomes a total core outage (the 2026-07-19 boot-block/CrashLoop).
+
+    The probe MUST NOT itself hang (that would defeat the point): the XINFO/XPENDING calls are each
+    bounded by a 2s wait_for and any failure degrades that field to ``"unavailable"`` — never blocks."""
     st = app.state
     now = time.monotonic()
     stale_s = getattr(st, "pipeline_tick_stale_s", 120.0)
     lag_alarm = getattr(st, "pipeline_lag_alarm", 500)
+    pending_alarm = getattr(st, "pipeline_pending_alarm", 100)
     loops = {name: round(now - ts, 1) for name, ts in (st.pipeline_ticks or {}).items()}
     degraded = any(age > stale_s for age in loops.values())
 
     lag = None
+    pending_depth = None
+    redis_reachable = None
     redis = getattr(st, "pipeline_redis", None)
     if redis is not None:
+        # #809: a bounded reachability PING FIRST — the honest per-component signal the 2026-07-19
+        # incident lacked (/health read "ok" through a 40-minute Redis outage). A dead Redis fails
+        # here within 2s; we then SKIP the stream probes (they would only time out too) and report
+        # their fields "unavailable". This NEVER sets `degraded`: Redis is a cache/queue, so the
+        # DB-backed readiness paths stay green and the shared probe stays 200 (no CrashLoop recurrence).
+        # `ping` is resolved defensively: a client without it (a minimal probe stub) leaves
+        # reachability UNKNOWN (None) and the stream probes run exactly as before — the real
+        # ``redis.asyncio`` client always has ``ping``, so production always gets the honest signal.
+        ping = getattr(redis, "ping", None)
+        if ping is not None:
+            try:
+                await asyncio.wait_for(ping(), timeout=2.0)
+                redis_reachable = True
+            except Exception:
+                redis_reachable = False
+    # Run the stream probes unless we KNOW Redis is down (reachable is False). Unknown (None, no
+    # ping) or True → probe, preserving the pre-#809 lag/pending behaviour.
+    if redis is not None and redis_reachable is not False:
         try:
             groups = await asyncio.wait_for(redis.xinfo_groups(st.pipeline_stream), timeout=2.0)
             for g in groups or []:
@@ -69,9 +122,31 @@ async def _pipeline_health(app) -> "tuple[dict, bool]":
                     break
         except Exception:
             lag = "unavailable"  # a dead/absent group is itself a signal, never a hang
+        # #636: PEL depth — a bounded XPENDING SUMMARY. A delivered-but-un-acked orphan is invisible
+        # to lag; a SUSTAINED non-zero total is the orphan signal (steady state acks within a tick).
+        try:
+            summary = await asyncio.wait_for(
+                redis.xpending(st.pipeline_stream, st.pipeline_group), timeout=2.0
+            )
+            pending_depth = _xpending_total(summary)
+            if pending_depth is None:
+                pending_depth = "unavailable"
+        except Exception:
+            pending_depth = "unavailable"  # never block the probe on a pending read
+    elif redis is not None and redis_reachable is False:
+        # #809: Redis unreachable → the stream signals are unavailable, but readiness is NOT degraded.
+        lag = "unavailable"
+        pending_depth = "unavailable"
     if isinstance(lag, int) and lag > lag_alarm:
         degraded = True
-    return {"loops": loops, "consumer_lag": lag}, degraded
+    if isinstance(pending_depth, int) and pending_depth > pending_alarm:
+        degraded = True
+    return {
+        "loops": loops,
+        "redis_reachable": redis_reachable,
+        "consumer_lag": lag,
+        "pending_depth": pending_depth,
+    }, degraded
 
 
 def create_app(
@@ -92,6 +167,10 @@ def create_app(
     command_publisher: Optional["object"] = None,
     # per-user webhook delivery sink (WebhookSink) — delivers meeting.status_change on each FSM advance
     webhook_sink: Optional["object"] = None,
+    # per-user delivery ledger (#841) — the queryable record GET /webhooks/deliveries reads. The
+    # lifecycle callback records each delivery outcome here so the dashboard's Delivery History
+    # reflects real deliveries, not just the Test button. None → in-memory fake (app-factory/tests).
+    delivery_ledger: Optional["object"] = None,
     # completion finalizer — awaited with the NUMERIC meeting id when the FSM lands on a TERMINAL
     # status (completed/failed). Production wires collector/db_writer.finalize_meeting: flush the
     # meeting's remaining redis segments to Postgres + persist the processed doc into meeting.data,
@@ -145,9 +224,17 @@ def create_app(
     app.state.lifecycle_sink = sink
     app.state.lifecycle_store = sink.store
     app.state.webhook_sink = webhook_sink
+    # #841: the per-user delivery ledger the read endpoint serves. Default to the in-memory fake so
+    # the app-factory / conformance path stands up without redis (same pattern as the other ports).
+    if delivery_ledger is None:
+        from .webhooks import InMemoryDeliveryLedger
+
+        delivery_ledger = InMemoryDeliveryLedger()
+    app.state.delivery_ledger = delivery_ledger
     # The lifecycle callback publishes each persisted FSM advance to bm:meeting:{id}:status so the
     # gateway /ws (which SUBSCRIBEs that channel) forwards a ws.v1 BotStatus frame to the dashboard.
-    _mount_lifecycle(app, sink, meeting_repo, webhook_sink, redis, transcript_finalizer)
+    _mount_lifecycle(app, sink, meeting_repo, webhook_sink, redis, transcript_finalizer,
+                     delivery_ledger)
 
     # --- bot_spawn: POST /bots (invocation.v1 + runtime.v1) ---
     app.include_router(_bot_spawn.build_router(meeting_repo, runtime))
@@ -176,10 +263,52 @@ def create_app(
         storage = _recordings_fakes().InMemoryStorage()
     app.include_router(_recordings.build_router(recording_repo, storage, token_secret=token_secret))
 
+    # --- webhooks: GET /webhooks/deliveries — the per-user delivery history the dashboard reads (#841) ---
+    app.include_router(_build_webhooks_router(delivery_ledger))
+
     return app
 
 
+# ── webhooks read surface (#841): the queryable delivery ledger the dashboard's history reads ────
+
+
+def _build_webhooks_router(delivery_ledger: "object") -> "object":
+    """``GET /webhooks/deliveries`` — the per-user webhook delivery history (#841).
+
+    Owner-scoped via ``X-User-Id`` (the gateway injects it from the resolved key; the client never
+    sets it). Returns ``{deliveries: [...]}`` newest-first — each row is the #817 outcome taxonomy
+    (host only, never a URL or secret; P14). This is the user-facing completion of #815→#817:
+    the dispatcher records every outcome here, so real deliveries appear in Delivery History, not
+    just the dashboard's own Test button.
+    """
+    from fastapi import APIRouter, Header, Query
+
+    router = APIRouter()
+
+    @router.get("/webhooks/deliveries")
+    async def list_deliveries(
+        x_user_id: Optional[str] = Header(default=None),
+        limit: int = Query(default=100, ge=1, le=500),
+    ):
+        user_id = x_user_id
+        deliveries = await delivery_ledger.list(user_id, limit=limit) if user_id else []
+        return {"deliveries": deliveries}
+
+    return router
+
+
 # ── lifecycle mount (the receiver's callback route, on the shared app) ───────────────────────────
+
+
+def _webhook_target_host(url: str) -> str:
+    """Host of a webhook URL, for the delivery log. Never the full URL: a subscriber's endpoint can
+    carry a token in its path or query, and an operator reading delivery outcomes does not need it."""
+    from urllib.parse import urlsplit
+
+    try:
+        return urlsplit(url).hostname or "?"
+    except Exception:  # noqa: BLE001 — a log field must never break delivery
+        return "?"
 
 
 def _mount_lifecycle(
@@ -189,6 +318,7 @@ def _mount_lifecycle(
     webhook_sink: "object" = None,
     redis: "object" = None,
     transcript_finalizer: "object" = None,
+    delivery_ledger: "object" = None,
 ) -> None:
     """Register the lifecycle.v1 callback route on the unified app (the lifecycle receiver's
     ``/bots/internal/callback/lifecycle`` handler, sharing the app's TraceMiddleware).
@@ -237,8 +367,8 @@ def _mount_lifecycle(
             "updated_at": _iso(row.get("updated_at")),
         }
 
-    app.state.status_change_webhooks = []
-    app.state.typed_webhooks = []
+    app.state.status_change_webhooks = deque(maxlen=_ENVELOPE_LOG_CAP)
+    app.state.typed_webhooks = deque(maxlen=_ENVELOPE_LOG_CAP)
 
     async def _apply_lifecycle_event(
         body: dict,
@@ -382,11 +512,57 @@ def _mount_lifecycle(
                     if env is None:
                         continue
                     try:
-                        await webhook_sink.deliver(
+                        result = await webhook_sink.deliver(
                             url, env, data.get("webhook_secret"),
                             events_config=data.get("webhook_events"),
                             label=f"meeting:{meeting_row.get('id')}",
                         )
+                        # EVERY outcome is reported (#815). `deliver` never raises — it returns
+                        # delivered | suppressed | blocked | failed | queued — and the outcome used
+                        # to be discarded, so a webhook the subscriber never received (unsubscribed
+                        # event type, SSRF-blocked target, 4xx endpoint) was indistinguishable from
+                        # one that arrived: "my webhooks stopped" was undiagnosable in production.
+                        # The target is reported as host only — a webhook URL can carry a secret in
+                        # its path or query, and logs are not a place to put one.
+                        log_event(
+                            "webhook_delivery",
+                            audience="system",
+                            level="info" if result.status == "delivered" else "warning",
+                            span="lifecycle.callback",
+                            meeting_id=meeting_row.get("id"),
+                            fields={
+                                "outcome": result.status,
+                                "event_type": env.get("event_type"),
+                                "target_host": _webhook_target_host(url),
+                                "status_code": result.status_code,
+                                "error": result.error,
+                            },
+                        )
+                        # #841: ALSO record the outcome in the per-user delivery ledger — the
+                        # queryable surface GET /webhooks/deliveries serves. Logs (above) rotate and
+                        # are operator-facing; the ledger is the user's Delivery History. Host only,
+                        # never the URL/secret (P14). Best-effort — a ledger hiccup never fails the
+                        # callback, and a suppressed event is still worth recording (the user asked
+                        # "why didn't my webhook fire?" — "suppressed: unsubscribed" is the answer).
+                        if delivery_ledger is not None:
+                            from .webhooks import build_delivery_record
+
+                            try:
+                                await delivery_ledger.record(
+                                    meeting_row.get("user_id"),
+                                    build_delivery_record(
+                                        event_type=env.get("event_type"),
+                                        event_id=env.get("event_id"),
+                                        target_host=_webhook_target_host(url),
+                                        outcome=result.status,
+                                        status_code=result.status_code,
+                                        meeting_id=meeting_row.get("id"),
+                                    ),
+                                )
+                            except Exception as le:  # noqa: BLE001 — ledger is best-effort
+                                log_event("webhook_ledger_failed", audience="system",
+                                          level="warning", span="lifecycle.callback",
+                                          fields={"error": str(le)})
                     except Exception as e:  # noqa: BLE001 — delivery is best-effort
                         log_event("webhook_deliver_failed", audience="system", level="warning",
                                   span="lifecycle.callback", fields={"error": str(e)})

@@ -24,6 +24,7 @@ from .ports import (
     QuotaExceeded,
     SpawnFailed,
     WorkloadUnknown,
+    reconcile_grace_for_status,
 )
 
 _ACTIVE_STATUSES = ("requested", "joining", "awaiting_admission", "active")
@@ -46,6 +47,15 @@ class InMemoryMeetingRepo:
                 and m["platform"] == platform
                 and m["native_meeting_id"] == native_meeting_id
                 and m["status"] in _ACTIVE_STATUSES
+            ):
+                return dict(m)
+        return None
+
+    async def find_active_by_userdata(self, userdata_s3_path) -> Optional[dict]:
+        for m in self._meetings.values():
+            if (
+                m["status"] in _ACTIVE_STATUSES
+                and m.get("data", {}).get("auth_userdata_path") == userdata_s3_path
             ):
                 return dict(m)
         return None
@@ -192,6 +202,16 @@ class InMemoryMeetingRepo:
         row["bot_container_id"] = bot_container_id
         return dict(row)
 
+    async def fail_meeting(self, *, meeting_id, reason, failure_stage="requested") -> Optional[dict]:
+        row = self._meetings.get(meeting_id)
+        if row is None:
+            return None
+        row["status"] = "failed"
+        row["data"]["failure_stage"] = failure_stage
+        row["data"]["failure_reason"] = reason
+        row["data"]["completion_reason"] = "start_failed"
+        return dict(row)
+
     async def get_status_by_session(self, *, session_uid) -> Optional[str]:
         sess = next((s for s in self.sessions if s["session_uid"] == session_uid), None)
         if sess is None:
@@ -208,7 +228,12 @@ class InMemoryMeetingRepo:
         sid = next(
             (s["session_uid"] for s in reversed(self.sessions) if s["meeting_id"] == row["id"]), None
         )
-        return {"meeting_id": row["id"], "status": row["status"], "session_uid": sid}
+        return {
+            "meeting_id": row["id"],
+            "status": row["status"],
+            "session_uid": sid,
+            "stop_requested": bool((row.get("data") or {}).get("stop_requested")),
+        }
 
     async def update_meeting_status(
         self, *, session_uid, status, completion_reason=None, failure_stage=None, data=None
@@ -238,12 +263,13 @@ class InMemoryMeetingRepo:
         )
 
     async def list_stale_nonterminal(
-        self, *, stop_grace: float, active_grace: float
+        self, *, stop_grace: float, active_grace: float, preactive_grace: Optional[float] = None
     ) -> list:
         """In-memory mirror of the SQL adapter's general reconcile query. A row is stale once its age
-        (now - ``updated_at``) passes its per-status grace (``stopping`` → stop_grace, else
-        active_grace). Rows carry a static created/updated timestamp, so a test sets ``updated_at`` (or
-        leaves it in the past) to mark a row stale; a row whose ``updated_at`` is recent is NOT listed."""
+        (now - ``updated_at``) passes its per-status grace (``reconcile_grace_for_status`` — the SAME
+        policy the SQL adapter reads, so the two listings cannot drift). Rows carry a static created/
+        updated timestamp, so a test sets ``updated_at`` (or leaves it in the past) to mark a row
+        stale; a row whose ``updated_at`` is recent is NOT listed."""
         from datetime import datetime, timezone
 
         non_terminal = {
@@ -268,7 +294,9 @@ class InMemoryMeetingRepo:
                 continue
             if u.tzinfo is None:
                 u = u.replace(tzinfo=timezone.utc)
-            grace = stop_grace if row["status"] == "stopping" else active_grace
+            grace = reconcile_grace_for_status(
+                row["status"], stop_grace, active_grace, preactive_grace
+            )
             if (now - u).total_seconds() < grace:
                 continue
             stop_req = bool(row.get("data", {}).get("stop_requested"))
@@ -285,9 +313,15 @@ class FakeRuntimeClient:
     """A ``RuntimeClient`` that records the spec and returns a synthetic ``workloadId``."""
 
     def __init__(self, *, quota_exceeded: bool = False, fail: bool = False,
+                 dead_on_arrival: bool = False,
                  workloads: Optional[dict[str, dict]] = None):
         self._quota_exceeded = quota_exceeded
         self._fail = fail
+        # dead_on_arrival models a kernel that (against #718 C1) still answers 201 but with a workload
+        # that never started (state=stopped/start_failed). The HTTP adapter's body-state check (C2)
+        # must catch it, so the FAKE returns that shape verbatim rather than raising — the belt of the
+        # belt-and-suspenders defense the adapter owns.
+        self._dead_on_arrival = dead_on_arrival
         self.specs: list[dict] = []  # every spawned spec, for assertions
         self.deleted: list[str] = []  # workload ids torn down (ROB3 compensation), for assertions
         # Liveness map for the reconcile sweep: workload_id -> status dict ({"state": ...}). A workload
@@ -301,6 +335,8 @@ class FakeRuntimeClient:
             raise QuotaExceeded("owner quota exceeded")
         if self._fail:
             raise SpawnFailed("kernel could not start the workload")
+        if self._dead_on_arrival:
+            return {"workloadId": spec["workloadId"], "state": "stopped", "stopReason": "start_failed"}
         return {"workloadId": spec["workloadId"], "state": "starting"}
 
     async def delete_workload(self, workload_id: str) -> None:

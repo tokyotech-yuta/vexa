@@ -60,6 +60,20 @@ def test_invocation_carries_stt_creds_when_provided():
     assert "transcriptionServiceUrl" not in build_invocation(**base)
 
 
+def test_invocation_carries_stt_model_when_provided():
+    """#522: a validating OpenAI-compatible backend (Groq, vLLM) needs its served model id on
+    every request. The deployment's choice rides the sealed invocation; absent → omitted, and
+    the whisper client falls back to whisper-1 (today's wire)."""
+    token = mint_meeting_token(1, USER, "google_meet", "abc-defg-hij", secret=SECRET)
+    base = dict(meeting_id=1, platform="google_meet", meeting_url="https://meet.google.com/abc-defg-hij",
+                bot_name="VexaBot", token=token, native_meeting_id="abc-defg-hij",
+                connection_id="conn-1", redis_url="redis://redis:6379/0")
+    inv = build_invocation(**base, transcription_model="whisper-large-v3-turbo")
+    conforms_invocation(inv)
+    assert inv["transcriptionModel"] == "whisper-large-v3-turbo"
+    assert "transcriptionModel" not in build_invocation(**base)
+
+
 def test_workload_spec_conforms_to_runtime_v1():
     inv = build_invocation(
         meeting_id=1, platform="google_meet", meeting_url="https://meet.google.com/x",
@@ -105,6 +119,18 @@ async def test_request_bot_eager_creates_session_and_spawns(monkeypatch):
     assert repo.sessions[0]["session_uid"] == spawned["connectionId"]
 
 
+def test_iso_utc_marks_naive_utc_with_z():
+    # Meeting time columns are naive but hold UTC. Serializing must emit a Z marker so a browser
+    # parses it as UTC and renders local — a bare isoformat is read as LOCAL (the 6h-skew bug).
+    from datetime import datetime, timezone
+
+    from meeting_api.bot_spawn.adapters import _iso_utc
+
+    assert _iso_utc(datetime(2026, 7, 20, 1, 0, 0)) == "2026-07-20T01:00:00Z"
+    assert _iso_utc(datetime(2026, 7, 20, 1, 0, 0, tzinfo=timezone.utc)) == "2026-07-20T01:00:00Z"
+    assert _iso_utc(None) is None
+
+
 async def test_request_bot_dedup_raises(monkeypatch):
     monkeypatch.setenv("TRANSCRIPTION_SERVICE_URL", "https://stt.vexa.ai")
     monkeypatch.setenv("TRANSCRIPTION_SERVICE_TOKEN", "tok-test")
@@ -129,6 +155,45 @@ async def test_request_bot_quota_propagates(monkeypatch):
                           native_meeting_id="x", redis_url="r", token_secret=SECRET)
 
 
+# ── #718: a workload DEAD AT START is refused, the row is failed with the reason, no `requested` lingers
+async def test_request_bot_dead_on_arrival_fails_the_row(monkeypatch):
+    """C2: the kernel answers 201 but with a workload that never started (state=stopped/start_failed).
+    ``create_workload`` catches the dead body → ``SpawnFailed``; ``request_bot`` marks the meeting
+    row ``failed`` with the reason so NO ``requested`` row remains, and creates no session.
+
+    Negative control (the bug): before the fix the dead 201 sailed through, the row stayed
+    ``requested``, and the reaper flipped it reason-less 5 minutes later."""
+    monkeypatch.setenv("TRANSCRIPTION_SERVICE_URL", "https://stt.vexa.ai")
+    monkeypatch.setenv("TRANSCRIPTION_SERVICE_TOKEN", "tok-test")
+    repo = InMemoryMeetingRepo()
+    runtime = FakeRuntimeClient(dead_on_arrival=True)
+    with pytest.raises(SpawnFailed) as ei:
+        await request_bot(repo, runtime, user_id=USER, platform="google_meet",
+                          native_meeting_id="dead", redis_url="r", token_secret=SECRET)
+    assert "start_failed" in str(ei.value)
+    # exactly one row, and it is FAILED with the reason — not a lingering `requested`.
+    rows = list(repo._meetings.values())
+    assert len(rows) == 1
+    row = rows[0]
+    assert row["status"] == "failed"
+    assert row["data"]["completion_reason"] == "start_failed"
+    assert "start_failed" in row["data"]["failure_reason"]
+    assert repo.sessions == [], "no MeetingSession for a workload that never started"
+
+
+async def test_request_bot_spawnfailed_fails_the_row(monkeypatch):
+    """The same row-failing discipline on the runtime-error path (create_workload raises SpawnFailed,
+    e.g. a non-201 from the kernel): the row is failed, not left ``requested``."""
+    monkeypatch.setenv("TRANSCRIPTION_SERVICE_URL", "https://stt.vexa.ai")
+    monkeypatch.setenv("TRANSCRIPTION_SERVICE_TOKEN", "tok-test")
+    repo = InMemoryMeetingRepo()
+    runtime = FakeRuntimeClient(fail=True)
+    with pytest.raises(SpawnFailed):
+        await request_bot(repo, runtime, user_id=USER, platform="google_meet",
+                          native_meeting_id="boom", redis_url="r", token_secret=SECRET)
+    assert list(repo._meetings.values())[0]["status"] == "failed"
+
+
 # ── route: POST /bots maps outcomes onto HTTP status ─────────────────────────────────────────────
 
 def _client(repo=None, runtime=None):
@@ -150,6 +215,73 @@ def test_post_bots_201(monkeypatch):
     assert r.json()["status"] == "requested"
 
 
+def test_post_bots_forwards_automatic_leave_to_invocation(monkeypatch):
+    monkeypatch.setenv("ADMIN_TOKEN", SECRET)
+    monkeypatch.setenv("TRANSCRIPTION_SERVICE_URL", "https://stt.vexa.ai")
+    repo, runtime = InMemoryMeetingRepo(), FakeRuntimeClient()
+    r = _client(repo, runtime).post(
+        "/bots", headers=HEADERS,
+        json={
+            "platform": "google_meet", "native_meeting_id": "silence-window",
+            "automatic_leave": {
+                "max_wait_for_admission": 321_000,
+                "max_time_left_alone": 12_345,
+                "everyone_left_timeout": 99_999,
+                "no_one_joined_timeout": 45_000,
+            },
+        },
+    )
+    assert r.status_code == 201, r.text
+    inv = json.loads(runtime.specs[0]["env"]["BOT_CONFIG"])
+    assert inv["automaticLeave"] == {
+        "waitingRoomTimeout": 321_000,
+        "everyoneLeftTimeout": 12_345,
+        "noOneJoinedTimeout": 45_000,
+    }
+
+
+def test_post_bots_legacy_everyone_left_alias_still_works(monkeypatch):
+    monkeypatch.setenv("ADMIN_TOKEN", SECRET)
+    monkeypatch.setenv("TRANSCRIPTION_SERVICE_URL", "https://stt.vexa.ai")
+    runtime = FakeRuntimeClient()
+    r = _client(runtime=runtime).post(
+        "/bots", headers=HEADERS,
+        json={
+            "platform": "google_meet", "native_meeting_id": "legacy-window",
+            "automatic_leave": {"everyone_left_timeout": 23_456},
+        },
+    )
+    assert r.status_code == 201, r.text
+    inv = json.loads(runtime.specs[0]["env"]["BOT_CONFIG"])
+    assert inv["automaticLeave"]["everyoneLeftTimeout"] == 23_456
+
+
+def test_post_bots_omits_everyone_left_when_not_explicit(monkeypatch):
+    monkeypatch.setenv("ADMIN_TOKEN", SECRET)
+    monkeypatch.setenv("TRANSCRIPTION_SERVICE_URL", "https://stt.vexa.ai")
+    runtime = FakeRuntimeClient()
+    r = _client(runtime=runtime).post(
+        "/bots", headers=HEADERS,
+        json={"platform": "google_meet", "native_meeting_id": "module-default"},
+    )
+    assert r.status_code == 201, r.text
+    inv = json.loads(runtime.specs[0]["env"]["BOT_CONFIG"])
+    assert inv["automaticLeave"] == {"waitingRoomTimeout": 600_000}
+
+
+def test_post_bots_rejects_invalid_automatic_leave_timeout(monkeypatch):
+    monkeypatch.setenv("TRANSCRIPTION_SERVICE_URL", "https://stt.vexa.ai")
+    r = _client().post(
+        "/bots", headers=HEADERS,
+        json={
+            "platform": "google_meet", "native_meeting_id": "bad-window",
+            "automatic_leave": {"max_time_left_alone": 0},
+        },
+    )
+    assert r.status_code == 422
+    assert "positive integer" in r.text
+
+
 def test_post_bots_409_on_duplicate(monkeypatch):
     monkeypatch.setenv("ADMIN_TOKEN", SECRET)
     monkeypatch.setenv("TRANSCRIPTION_SERVICE_URL", "https://stt.vexa.ai")
@@ -169,6 +301,22 @@ def test_post_bots_429_on_quota(monkeypatch):
     r = client.post("/bots", headers=HEADERS,
                     json={"platform": "google_meet", "native_meeting_id": "x"})
     assert r.status_code == 429
+
+
+def test_post_bots_502_when_workload_dead_on_arrival(monkeypatch):
+    """Route level (#718 A1): a workload dead at start → POST /bots is 502 naming the reason, and the
+    meeting row is ``failed`` (NOT a lingering ``requested`` that would 409 the user's retry)."""
+    monkeypatch.setenv("ADMIN_TOKEN", SECRET)
+    monkeypatch.setenv("TRANSCRIPTION_SERVICE_URL", "https://stt.vexa.ai")
+    monkeypatch.setenv("TRANSCRIPTION_SERVICE_TOKEN", "tok-test")
+    repo, runtime = InMemoryMeetingRepo(), FakeRuntimeClient(dead_on_arrival=True)
+    client = _client(repo, runtime)
+    r = client.post("/bots", headers=HEADERS,
+                    json={"platform": "google_meet", "native_meeting_id": "dead-201"})
+    assert r.status_code == 502, f"a dead-at-start spawn must not 201; got {r.status_code}"
+    assert "start_failed" in r.json()["detail"]
+    rows = list(repo._meetings.values())
+    assert len(rows) == 1 and rows[0]["status"] == "failed"
 
 
 def test_post_bots_401_without_identity(monkeypatch):
@@ -227,6 +375,8 @@ async def test_request_bot_configured_transcription_backend_overrides_env(monkey
         assert user_id == USER
         return {"url": "https://stt-mine.example.com"}
 
+    monkeypatch.setenv("TRANSCRIPTION_MODEL", "env-model")
+
     monkeypatch.setattr(spawn_service, "_resolve_transcription_backend", fake_resolve)
     repo = InMemoryMeetingRepo()
     runtime = FakeRuntimeClient()
@@ -236,6 +386,7 @@ async def test_request_bot_configured_transcription_backend_overrides_env(monkey
     inv = json.loads(runtime.specs[0]["env"]["BOT_CONFIG"])
     assert inv["transcriptionServiceUrl"] == "https://stt-mine.example.com"
     assert "transcriptionServiceToken" not in inv  # env token does NOT leak to the custom backend
+    assert "transcriptionModel" not in inv  # env model names the ENV backend's model — same rule
 
 
 async def test_request_bot_env_transcription_stays_without_settings(monkeypatch):
@@ -253,6 +404,30 @@ async def test_request_bot_env_transcription_stays_without_settings(monkeypatch)
     inv = json.loads(runtime.specs[0]["env"]["BOT_CONFIG"])
     assert inv["transcriptionServiceUrl"] == "https://stt-env.vexa.ai"
     assert inv["transcriptionServiceToken"] == "tok-env"
+
+
+async def test_request_bot_env_transcription_model_rides_invocation(monkeypatch):
+    """#522 V1: ``TRANSCRIPTION_MODEL`` set on the deployment reaches every bot's invocation;
+    unset → the field is omitted and the whisper client sends whisper-1 (today's wire)."""
+    monkeypatch.setenv("TRANSCRIPTION_SERVICE_URL", "https://stt-env.vexa.ai")
+    monkeypatch.setenv("TRANSCRIPTION_SERVICE_TOKEN", "tok-env")
+    monkeypatch.delenv("ADMIN_API_URL", raising=False)
+
+    monkeypatch.setenv("TRANSCRIPTION_MODEL", "whisper-large-v3-turbo")
+    repo, runtime = InMemoryMeetingRepo(), FakeRuntimeClient()
+    await request_bot(repo, runtime, user_id=USER, platform="google_meet",
+                      native_meeting_id="abc-defg-hij", redis_url="redis://redis:6379/0",
+                      token_secret=SECRET)
+    inv = json.loads(runtime.specs[0]["env"]["BOT_CONFIG"])
+    assert inv["transcriptionModel"] == "whisper-large-v3-turbo"
+
+    monkeypatch.delenv("TRANSCRIPTION_MODEL", raising=False)
+    repo, runtime = InMemoryMeetingRepo(), FakeRuntimeClient()
+    await request_bot(repo, runtime, user_id=USER, platform="google_meet",
+                      native_meeting_id="abc-defg-hij", redis_url="redis://redis:6379/0",
+                      token_secret=SECRET)
+    inv = json.loads(runtime.specs[0]["env"]["BOT_CONFIG"])
+    assert "transcriptionModel" not in inv
 
 
 # ── route: meeting_url passthrough is SSRF-validated at entry (jitsi/zoom, TAKE on #543) ─────────
@@ -306,3 +481,242 @@ def test_post_bots_zoom_shares_meeting_url_guard(monkeypatch):
                        json={"platform": "zoom", "native_meeting_id": "123456",
                              "meeting_url": "https://192.168.1.10/j/123456"})
     assert r.status_code == 422, r.text
+
+
+# ── route: meeting_url-only bodies derive the addressing key, or refuse typed (#792) ─────────────
+#
+# api.v1's `meeting_url` description promises: "When provided without native_meeting_id, the URL is
+# parsed to extract platform, native_meeting_id, and passcode automatically." A url-only body must
+# therefore yield an ADDRESSABLE meeting (id derived via collector.meeting_link.parse_meeting_url)
+# or a typed 422 — never a 201 persisting native_meeting_id='' (the unaddressable orphan).
+
+def _spawn_env(monkeypatch):
+    monkeypatch.setenv("ADMIN_TOKEN", SECRET)
+    monkeypatch.setenv("TRANSCRIPTION_SERVICE_URL", "https://stt.vexa.ai")
+    monkeypatch.setenv("TRANSCRIPTION_SERVICE_TOKEN", "tok-test")
+
+
+def test_post_bots_url_only_derives_native_id(monkeypatch):
+    """Row 1: platform + meeting_url, no native id → 201 with the id derived from the URL."""
+    _spawn_env(monkeypatch)
+    repo = InMemoryMeetingRepo()
+    r = _client(repo).post("/bots", headers=HEADERS,
+                           json={"platform": "google_meet",
+                                 "meeting_url": "https://meet.google.com/abc-defg-hij"})
+    assert r.status_code == 201, r.text
+    assert r.json()["native_meeting_id"] == "abc-defg-hij"
+    row = repo._meetings[1]
+    assert row["native_meeting_id"] == "abc-defg-hij"
+
+
+def test_post_bots_url_only_meeting_is_stop_addressable(monkeypatch):
+    """Row 2: a url-only spawn can be stopped via DELETE /bots/{platform}/{derived_id}."""
+    from fastapi import FastAPI
+
+    from meeting_api.lifecycle.stop_router import InMemoryCommandPublisher, build_stop_router
+
+    _spawn_env(monkeypatch)
+    repo, runtime = InMemoryMeetingRepo(), FakeRuntimeClient()
+    app = FastAPI()
+    app.include_router(build_router(repo, runtime))
+    app.include_router(build_stop_router(repo, InMemoryCommandPublisher(), runtime))
+    client = TestClient(app)
+    assert client.post("/bots", headers=HEADERS,
+                       json={"platform": "google_meet",
+                             "meeting_url": "https://meet.google.com/abc-defg-hij"}).status_code == 201
+    r = client.delete("/bots/google_meet/abc-defg-hij", headers=HEADERS)
+    assert r.status_code == 200, r.text
+    assert r.json()["status"] == "stopping"
+
+
+def test_post_bots_underivable_url_422_no_row(monkeypatch):
+    """Row 3: https URL that passes the SSRF guard but yields no id → typed 422, nothing persisted."""
+    _spawn_env(monkeypatch)
+    repo = InMemoryMeetingRepo()
+    r = _client(repo).post("/bots", headers=HEADERS,
+                           json={"platform": "google_meet",
+                                 "meeting_url": "https://example.com/not-a-meet-link"})
+    assert r.status_code == 422, r.text
+    assert "native_meeting_id" in r.json()["detail"]
+    assert repo._meetings == {}  # never persist the '' orphan
+
+
+def test_post_bots_url_only_no_platform_derives_both(monkeypatch):
+    """Row 4: the report's literal body — meeting_url alone → platform AND id derived."""
+    _spawn_env(monkeypatch)
+    repo = InMemoryMeetingRepo()
+    r = _client(repo).post("/bots", headers=HEADERS,
+                           json={"meeting_url": "https://meet.google.com/abc-defg-hij"})
+    assert r.status_code == 201, r.text
+    body = r.json()
+    assert body["platform"] == "google_meet"
+    assert body["native_meeting_id"] == "abc-defg-hij"
+
+
+def test_post_bots_platform_url_mismatch_422(monkeypatch):
+    """Row 5: supplied platform disagrees with the URL-derived one → 422 naming both."""
+    _spawn_env(monkeypatch)
+    repo = InMemoryMeetingRepo()
+    r = _client(repo).post("/bots", headers=HEADERS,
+                           json={"platform": "teams",
+                                 "meeting_url": "https://meet.google.com/abc-defg-hij"})
+    assert r.status_code == 422, r.text
+    detail = r.json()["detail"]
+    assert "teams" in detail and "google_meet" in detail
+    assert repo._meetings == {}
+
+
+def test_post_bots_url_only_jitsi_derives_room(monkeypatch):
+    """F2: jitsi derivation accepted — the room (+host scope) becomes the native id, URL rides along."""
+    _spawn_env(monkeypatch)
+    repo = InMemoryMeetingRepo()
+    r = _client(repo).post("/bots", headers=HEADERS,
+                           json={"meeting_url": "https://meet.example.org/daily"})
+    assert r.status_code == 201, r.text
+    body = r.json()
+    assert body["platform"] == "jitsi"
+    assert body["native_meeting_id"] == "daily@meet.example.org"
+
+
+def test_post_bots_url_only_derives_passcode(monkeypatch):
+    """F4: the contract sentence also promises passcode extraction — zoom ?pwd= rides into the
+    invocation when the body carries none."""
+    _spawn_env(monkeypatch)
+    repo, runtime = InMemoryMeetingRepo(), FakeRuntimeClient()
+    r = _client(repo, runtime).post("/bots", headers=HEADERS,
+                                    json={"meeting_url": "https://us02web.zoom.us/j/1234567890?pwd=sEcReT123"})
+    assert r.status_code == 201, r.text
+    assert r.json()["native_meeting_id"] == "1234567890"
+    inv = json.loads(runtime.specs[0]["env"]["BOT_CONFIG"])
+    assert inv["passcode"] == "sEcReT123"
+
+
+def test_post_bots_explicit_native_id_unchanged_by_url(monkeypatch):
+    """Row 6 companion: an explicit native_meeting_id is NEVER overridden by the URL (derivation
+    only fills the gap; the valid 0.12 body is byte-identical)."""
+    _spawn_env(monkeypatch)
+    repo = InMemoryMeetingRepo()
+    r = _client(repo).post("/bots", headers=HEADERS,
+                           json={"platform": "google_meet", "native_meeting_id": "xyz-explicit-id",
+                                 "meeting_url": "https://meet.google.com/abc-defg-hij"})
+    assert r.status_code == 201, r.text
+    assert repo._meetings[1]["native_meeting_id"] == "xyz-explicit-id"
+
+
+# ── #816 hardening: a non-spawnable platform is refused typed, BEFORE any DB write ──────────────
+# api.v1 seals MORE platforms than invocation.v1 (`browser_session` — a provisioning workload, not
+# a meeting bot). With a meeting_url attached, such a request used to pass the constructibility
+# guard, WRITE its `requested` row, then die inside build_invocation's sealed-schema validation:
+# a 500 plus an orphaned active row that 409'd the user's retry on the dedup guard.
+
+
+def test_browser_session_with_url_is_422_and_writes_no_row(monkeypatch):
+    monkeypatch.setenv("ADMIN_TOKEN", "test-admin-token")
+    repo = InMemoryMeetingRepo()
+    r = _client(repo).post("/bots", headers=HEADERS, json={
+        "platform": "browser_session",
+        "native_meeting_id": "bs-deadbeef",
+        "meeting_url": "https://internal.example/browser-session",
+    })
+    assert r.status_code == 422, f"{r.status_code} {r.text}"
+    detail = r.json()["detail"]
+    assert "browser_session" in detail and "816" in detail, (
+        f"the refusal must name the tracked restoration, got: {detail}"
+    )
+    assert repo._meetings == {}, f"refused spawn wrote a meeting row: {repo._meetings}"
+
+    # And the retry is NOT poisoned: an ordinary meeting on the same repo still spawns.
+    ok = _client(repo).post("/bots", headers=HEADERS, json={
+        "platform": "google_meet", "native_meeting_id": "after-refusal",
+    })
+    assert ok.status_code == 201, ok.text
+
+
+def test_spawnable_platforms_is_the_sealed_invocation_enum():
+    """SSOT: the router's refusal set is READ from the sealed invocation.v1 schema, so it can
+    never drift from what build_invocation will actually accept."""
+    from meeting_api.bot_spawn.invocation import SPAWNABLE_PLATFORMS, _INVOCATION_SCHEMA
+
+    assert SPAWNABLE_PLATFORMS == frozenset(_INVOCATION_SCHEMA["$defs"]["Platform"]["enum"])
+    assert "browser_session" not in SPAWNABLE_PLATFORMS
+
+
+def test_native_meeting_id_over_column_length_is_422_not_500(monkeypatch):
+    """#843: `platform_specific_id` is varchar(255). An over-long id used to sail past this
+    boundary and die at the INSERT on asyncpg's StringDataRightTruncationError — a 500 ~5.6s in,
+    observed in production. It must be refused HERE, typed, and write no row."""
+    monkeypatch.setenv("ADMIN_TOKEN", "test-admin-token")
+    repo = InMemoryMeetingRepo()
+    r = _client(repo).post("/bots", headers=HEADERS, json={
+        "platform": "google_meet", "native_meeting_id": "A" * 20000,
+    })
+    assert r.status_code == 422, f"expected typed refusal, got {r.status_code} {r.text}"
+    detail = r.json()["detail"]
+    assert "255" in detail, f"the refusal must name the limit, got: {detail}"
+    assert repo._meetings == {}, f"refused spawn wrote a meeting row: {repo._meetings}"
+
+
+def test_native_meeting_id_with_nul_byte_is_422_not_500(monkeypatch):
+    """#843: a NUL byte reaches Postgres as an invalid text value and 500s at the INSERT."""
+    monkeypatch.setenv("ADMIN_TOKEN", "test-admin-token")
+    repo = InMemoryMeetingRepo()
+    r = _client(repo).post("/bots", headers=HEADERS, json={
+        "platform": "google_meet", "native_meeting_id": "abc" + chr(0) + "def",
+    })
+    assert r.status_code == 422, f"expected typed refusal, got {r.status_code} {r.text}"
+    assert "control" in r.json()["detail"].lower(), r.text
+    assert repo._meetings == {}, f"refused spawn wrote a meeting row: {repo._meetings}"
+
+
+def test_native_meeting_id_bounds_do_not_validate_SHAPE(monkeypatch):
+    """NEGATIVE CONTROL — the guard bounds length/bytes and URL-structural chars ONLY, never the
+    id's SEMANTIC shape.
+
+    Production evidence: a bare-numeric Teams id (the dial-in kind) transcribed a real meeting
+    (24368, 67 segments) while another of the SAME shape failed. Shape does not predict success,
+    so a format rule would refuse working meetings. The Teams thread-id form
+    (`19:…@thread.v2` — `: @ . _ -`) and Meet dash-codes must all still spawn; only URL-structural
+    chars are refused (see #892 test below)."""
+    monkeypatch.setenv("ADMIN_TOKEN", "test-admin-token")
+    for odd_but_legal in (
+        "474226440982", "abc-defg-hij", "x", "A" * 255,
+        "19:meeting_AbC-dEf_123@thread.v2",  # Teams thread id: `:@._-` must survive the #892 guard
+    ):
+        repo = InMemoryMeetingRepo()
+        r = _client(repo).post("/bots", headers=HEADERS, json={
+            "platform": "google_meet", "native_meeting_id": odd_but_legal,
+        })
+        assert r.status_code == 201, f"{odd_but_legal!r} was refused: {r.status_code} {r.text}"
+
+
+def test_native_meeting_id_with_url_chars_is_422_not_join_failure(monkeypatch):
+    """#892: a `native_meeting_id` carrying URL-structural chars (a Teams passcode left on the id,
+    `397421056486982?p=X8hc…`) is short and control-free, so it passed the #843/#855 length+control
+    guards, then string-interpolated into `construct_meeting_url` to build a broken join URL
+    (`…/l/meetup-join/…982?p=X8hc…` → join_failure) and stored an unfindable `platform_specific_id`.
+    It must be refused HERE, typed 422, naming the fix, and write NO row."""
+    monkeypatch.setenv("ADMIN_TOKEN", "test-admin-token")
+    # The reproduced value from the issue, plus one per URL-structural class + a literal space.
+    for bad_id in (
+        "397421056486982?p=X8hcQVTnGNpGelJLSv",  # the reproduced Teams-passcode case
+        "abc?def", "abc&def", "abc=def", "abc/def", "abc#def", "abc def",
+    ):
+        repo = InMemoryMeetingRepo()
+        r = _client(repo).post("/bots", headers=HEADERS, json={
+            "platform": "teams", "native_meeting_id": bad_id,
+        })
+        assert r.status_code == 422, f"{bad_id!r} expected typed 422, got {r.status_code} {r.text}"
+        detail = r.json()["detail"]
+        assert "native_meeting_id" in detail and "passcode" in detail, (
+            f"the refusal must name the id and the fix, got: {detail}"
+        )
+        assert repo._meetings == {}, f"refused spawn wrote a meeting row: {repo._meetings}"
+
+    # POSITIVE CONTROL — the bare id + a separate passcode still spawns (the meeting-13564 pattern:
+    # pass the passcode in its own field, not glued onto the id).
+    repo = InMemoryMeetingRepo()
+    ok = _client(repo).post("/bots", headers=HEADERS, json={
+        "platform": "teams", "native_meeting_id": "397421056486982",
+        "passcode": "X8hcQVTnGNpGelJLSv",
+    })
+    assert ok.status_code == 201, f"bare id + separate passcode was refused: {ok.text}"

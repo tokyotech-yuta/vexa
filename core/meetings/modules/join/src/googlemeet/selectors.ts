@@ -8,6 +8,15 @@
 // by the detectors' try/catch loops (dead selectors). All `text*="foo"`
 // entries were replaced with the unquoted substring form on 2026-07-04;
 // src/shared/selector-validity.test.ts now gates every selector array.
+//
+// EXECUTION-CONTEXT SEMANTICS: Playwright engines (`text=`, `:has-text()`)
+// exist ONLY on the Playwright side (page.locator). Anything shipped into
+// page.evaluate runs through document.querySelector, which understands plain
+// CSS and nothing else — a Playwright-only entry there throws SyntaxError on
+// every call. Arrays consumed in browser context are declared in
+// browserContextSelectorArrays (bottom of this file); the validity gate
+// CSS-parses each declared entry, and text-labelled buttons are expressed as
+// `{ text: … }` matcher fields, matched in-page against textContent.
 
 export const googleInitialAdmissionIndicators: string[] = [
   // DOM fallback selectors — only indicators that do NOT appear in the lobby.
@@ -207,43 +216,6 @@ export const googleParticipantContainerSelectors: string[] = [
   '[jsname="BOHaEe"]' // Google Meet meeting container
 ];
 
-// Leave button selectors (used in browser context via page.evaluate)
-export const googlePrimaryLeaveButtonSelectors: string[] = [
-  // Primary Google Meet leave button
-  'button[aria-label="Leave call"]',
-  
-  // Alternative leave button patterns
-  'button[aria-label*="Leave"]',
-  'button[aria-label*="leave"]',
-  'button[aria-label*="End meeting"]',
-  'button[aria-label*="end meeting"]',
-  'button[aria-label*="Hang up"]',
-  'button[aria-label*="hang up"]',
-  
-  // Toolbar-based selectors
-  '[role="toolbar"] button[aria-label*="Leave"]'
-];
-
-export const googleSecondaryLeaveButtonSelectors: string[] = [
-  // Confirmation dialog leave buttons
-  'button:has-text("Leave meeting")',
-  'button:has-text("Just leave the meeting")',
-  'button:has-text("Leave")',
-  'button:has-text("End meeting")',
-  'button:has-text("Hang up")',
-  'button:has-text("End call")',
-  'button:has-text("Leave call")',
-  
-  // Dialog-specific selectors
-  '[role="dialog"] button:has-text("Leave")',
-  '[role="dialog"] button:has-text("End meeting")',
-  '[role="alertdialog"] button:has-text("Leave")',
-  
-  // Generic confirmation patterns
-  'button[aria-label*="confirm"]:has-text("Leave")',
-  'button[aria-label*="confirm"]:has-text("End")'
-];
-
 // Google Meet name selectors for participant identification
 export const googleNameSelectors: string[] = [
   // Google Meet specific name selectors
@@ -298,28 +270,67 @@ export const googleRemovalIndicators: string[] = [
 
 // Google Meet UI interaction selectors.
 //
-// Locale-agnostic FIRST (structure / jsname / role), then English text as a
-// fallback. The English-literal `text()="Ask to join"` / has-text locators only
-// match an English UI, so a Hungarian (or any non-English) Meet lobby never
-// found the join button — the bot sat in the lobby until manual_leave
-// (prod ids 13951 13952 14018 14153). The primary admission CTA in the Meet
-// lobby is the last/right-most jsname-tagged <button> in the lobby controls;
-// it carries a jsname and is the only enabled <button> with non-icon text.
+// ORDER IS AUTHORITATIVE: join.ts resolves these lists top-down on every poll,
+// so an earlier entry always beats a later one on the same DOM.
+//
+// The first entry is the locale-agnostic one; the English literals follow. The
+// `text()="Ask to join"` / has-text locators only match an English UI, so a
+// Hungarian (or any non-English) Meet lobby cannot be joined by them alone
+// (prod ids 13951 13952 14018 14153).
+//
+// COVERAGE LIMIT — read before adding to this list: the structural entry can
+// only see a lobby whose CTA carries NO accessible label. `:not([aria-label])`
+// is load-bearing (the lobby's aria-labelled 3-dot menu is otherwise a
+// `button[jsname]` with a span, and the humanized click lands on the menu), but
+// it also blinds this list to a lobby whose CTA IS aria-labelled. That shape is
+// NOT closed by widening this list; the real fix is #856 — the browser's UI
+// locale is now pinned (`--lang=en-US`, context `locale`), so Meet renders the
+// English lobby by construction and the exact-text entries below are correct,
+// not lucky. `findLobbyPrimaryCta` in join.ts still scans, but only as a
+// diagnostic (it never clicks) — see its docs.
+//
+// ORDERING IS AUTHORITATIVE: `waitForAnySelector` resolves this list top-down on
+// every poll (ordered, not raced), so list position decides which control wins.
+// The EXACT text selectors come FIRST and the broad structural
+// `button[jsname]:not([aria-label]):has(span)` entry comes LAST — deliberately
+// inverting #917's ordering. With the locale pinned, the exact English match is
+// the right control; the broad entry can match a wrong jsname+span button that
+// happens to sit earlier in DOM order, so it must only win when nothing exact
+// does. Do NOT move the structural entry up, and do NOT delete it (it is the
+// last-resort locale-agnostic backstop).
 export const googleJoinButtonSelectors: string[] = [
-  // Locale-agnostic: a real <button> carrying Google's jsname token whose label
-  // text is non-empty (excludes icon-only mic/camera toggles which have no text
-  // node). Matches "Ask to join"/"Join now"/localized equivalents alike.
-  'button[jsname]:not([aria-label]):has(span)',
-  // NB: must exclude [aria-label] — the lobby 3-dot "more options" menu is also a
-  // div[jscontroller] button[jsname] with a span; without this filter it matched
-  // FIRST and the humanized click landed on the menu, never "Ask to join".
-  'div[jscontroller] button[jsname]:not([aria-label]):has(span)',
-  // English fallbacks (kept for resilience on English UIs).
+  // Exact text FIRST — correct by construction now the UI locale is pinned (#856).
   '//button[.//span[text()="Ask to join"]]',
   'button:has-text("Ask to join")',
   'button:has-text("Join now")',
-  'button:has-text("Join")'
+  'button:has-text("Join")',
+  // Broad structural backstop LAST: a real <button> with Google's jsname token, a
+  // text span and no accessible label. Only wins if no exact selector matches.
+  'button[jsname]:not([aria-label]):has(span)'
 ];
+
+// Icon-glyph descendants of a lobby <button>. A button containing any of these
+// is an icon affordance (mic / camera / 3-dot menu / "cast this meeting" /
+// "use a phone for audio"), never the primary admission CTA — Meet renders that
+// one as text only. Consumed by `findLobbyPrimaryCta` in join.ts, which runs in
+// BROWSER CONTEXT through document.querySelector, so every entry must be plain
+// CSS (declared in browserContextSelectorArrays below; the validity gate
+// CSS-parses it). Material icons carry their glyph name as a TEXT node
+// ("mic_off", "more_vert"), so excluding these elements is what keeps an
+// icon-only button from reading as a text-labelled one.
+export const googleLobbyIconGlyphSelectors: string[] = [
+  'i',
+  'svg',
+  'img',
+  '[class*="material-icons"]',
+  '[class*="material-symbols"]',
+  '[data-icon-name]'
+];
+
+// A primary CTA label is a couple of words in any language ("Ask to join",
+// "Kérvényezés a csatlakozásra", "参加をリクエスト"). Anything longer is prose —
+// a disclosure/consent paragraph rendered as a button — and is not a CTA.
+export const googleLobbyCtaMaxLabelChars = 48;
 
 export const googleCameraButtonSelectors: string[] = [
   '[aria-label*="Turn off camera"]',
@@ -349,6 +360,36 @@ export const googleNameInputSelectors: string[] = [
   'input[placeholder*="Name"]'
 ];
 
+// Authenticated-lobby primary CTA — "Join now" / "Switch here" / "Ask to join".
+// Same ordering rule as googleJoinButtonSelectors above: ordered resolution makes
+// list position authoritative, so the EXACT text selectors come FIRST and the
+// broad structural `button[jsname]:not([aria-label]):has(span)` entry comes LAST.
+// With the UI locale pinned (#856) the English text is correct by construction;
+// the broad entry is only the last-resort backstop and must not beat an exact
+// match. `findLobbyPrimaryCta` scans here too, diagnostic-only (never clicks).
+export const googleAuthJoinCtaSelectors: string[] = [
+  // Exact text FIRST.
+  'button:has-text("Join now")',
+  'button:has-text("Switch here")',
+  'button:has-text("Ask to join")',
+  // Broad structural backstop LAST.
+  'button[jsname]:not([aria-label]):has(span)'
+];
+
+// Signed-out guard probe (authenticated mode): a guest lobby renders a name
+// input; a signed-in lobby never does, in any locale. Structural selectors
+// FIRST so signed-out detection cannot fail open on a non-English lobby; the
+// English aria-label is a fallback only. Kept narrower than
+// googleNameInputSelectors on purpose — a false positive here refuses a
+// legitimate authenticated join, so the broad bare input[type="text"] catch-all
+// is excluded.
+export const googleSignedOutLobbyProbeSelectors: string[] = [
+  'input[jsname][type="text"]',
+  'div[jscontroller] input[type="text"]',
+  // English fallback.
+  'input[type="text"][aria-label="Your name"]'
+];
+
 // Google Meet meeting container selectors
 export const googleMeetingContainerSelectors: string[] = [
   '[jsname="BOHaEe"]', // Primary Google Meet container
@@ -363,41 +404,51 @@ export const googleParticipantIdSelectors: string[] = [
   '[jsinstance]'
 ];
 
-// Google Meet comprehensive leave selectors (stateless - covers all scenarios)
-export const googleLeaveSelectors: string[] = [
-  // WORKING SELECTORS FIRST - Google Meet primary leave button
-  'button[aria-label="Leave call"]', // ✅ Primary Google Meet leave button
-  
+// Browser-context button matcher — the canonical shape lives in
+// ../shared/leave-click (shared with msteams); imported for local use below
+// and re-exported so this module's existing importers keep their reference.
+import type { BrowserContextButtonMatcher } from "../shared/leave-click";
+export type { BrowserContextButtonMatcher };
+
+// Google Meet comprehensive leave matchers (stateless - covers all scenarios).
+// BROWSER CONTEXT: consumed inside page.evaluate via document.querySelector —
+// declared in browserContextSelectorArrays below, so the validity gate
+// CSS-parses every `css` field. Tried in order; first visible match wins.
+export const googleLeaveButtonMatchers: BrowserContextButtonMatcher[] = [
+  // Primary Google Meet leave button
+  { css: 'button[aria-label="Leave call"]' },
+
   // Alternative leave patterns
-  'button[aria-label*="Leave"]',
-  'button[aria-label*="leave"]',
-  '[role="toolbar"] button[aria-label*="Leave"]',
-  
+  { css: 'button[aria-label*="Leave"]' },
+  { css: 'button[aria-label*="leave"]' },
+  { css: '[role="toolbar"] button[aria-label*="Leave"]' },
+
   // End meeting alternatives
-  'button[aria-label*="End meeting"]',
-  'button:has-text("End meeting")',
-  'button[aria-label*="Hang up"]',
-  'button:has-text("Hang up")',
-  
+  { css: 'button[aria-label*="End meeting"]' },
+  { text: 'End meeting' },
+  { text: 'End call' },
+  { css: 'button[aria-label*="Hang up"]' },
+  { text: 'Hang up' },
+
   // Confirmation dialog buttons (secondary)
-  'button:has-text("Leave meeting")',
-  'button:has-text("Just leave the meeting")',
-  'button:has-text("Leave")',
-  
+  { text: 'Leave meeting' },
+  { text: 'Just leave the meeting' },
+  { text: 'Leave' },
+
   // Dialog-specific patterns
-  '[role="dialog"] button:has-text("Leave")',
-  '[role="dialog"] button:has-text("End meeting")',
-  '[role="alertdialog"] button:has-text("Leave")',
-  
+  { css: '[role="dialog"] button', text: 'Leave' },
+  { css: '[role="dialog"] button', text: 'End meeting' },
+  { css: '[role="alertdialog"] button', text: 'Leave' },
+
   // Generic close/cancel patterns
-  'button:has-text("Close")',
-  'button[aria-label="Close"]',
-  'button:has-text("Cancel")',
-  'button[aria-label="Cancel"]',
-  
+  { text: 'Close' },
+  { css: 'button[aria-label="Close"]' },
+  { text: 'Cancel' },
+  { css: 'button[aria-label="Cancel"]' },
+
   // Fallback patterns
-  'input[type="button"][value="Leave"]',
-  'input[type="submit"][value="Leave"]'
+  { css: 'input[type="button"][value="Leave"]' },
+  { css: 'input[type="submit"][value="Leave"]' }
 ];
 
 // Google Meet people/participant panel selectors
@@ -421,5 +472,17 @@ export const googlePeopleButtonSelectors: string[] = [
   'button[data-tooltip*="People"]',
   'button[data-tooltip*="participants"]',
   'button[data-tooltip*="Participants"]'
+];
+
+// EXECUTION-CONTEXT DECLARATION — consumed by src/shared/selector-validity.test.ts.
+// Arrays named here ship into page.evaluate and run through
+// document.querySelector, so the gate additionally CSS-parses them: a
+// Playwright parse alone would let `:has-text()` — invalid in that context —
+// ship green as a dead selector. Entries may be plain CSS strings or
+// BrowserContextButtonMatcher objects (`css` field parsed as CSS; `text`
+// fields are raw strings, not selectors).
+export const browserContextSelectorArrays: string[] = [
+  'googleLeaveButtonMatchers',
+  'googleLobbyIconGlyphSelectors',
 ];
 

@@ -30,6 +30,7 @@
           "how-to/calendar-sync",
           "how-to/send-a-bot",
           "how-to/stream-transcript",
+          "how-to/custom-stt",
           "how-to/recordings"
         ]
       },
@@ -93,6 +94,7 @@
           "deployment",
           "deployment-kubernetes",
           "configuration",
+          "authenticated-bots",
           "model-credentials-licensing",
           "security-compliance",
           "troubleshooting",

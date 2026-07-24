@@ -47,17 +47,22 @@ curl -X POST "$ADMIN/admin/users" \
   -d '{"email":"jane@acme.com","name":"Jane","max_concurrent_bots":2}'
 # → {"id":1,"email":"jane@acme.com","name":"Jane","max_concurrent_bots":2}
 
-# 2. mint a key for that user id
-curl -X POST "$ADMIN/admin/users/1/tokens?scopes=bot,tx" \
-  -H "X-Admin-API-Key: $ADMIN_TOKEN"
+# 2. mint a key for that user id (JSON body preferred)
+curl -X POST "$ADMIN/admin/users/1/tokens" \
+  -H "X-Admin-API-Key: $ADMIN_TOKEN" -H "Content-Type: application/json" \
+  -d '{"scopes":["bot","tx"]}'
 # → {"id":7,"token":"vxa_bot_...","user_id":1,"scopes":["bot","tx"]}
+
+# query form still works: ?scopes=bot,tx or ?scope=bot
 ```
 
 The returned `token` is your `X-API-Key`. **It is shown once** — store it.
 
 ## Scopes
 
-A key carries one or more scopes. Pass `scope=<one>` or `scopes=<a>,<b>` when minting.
+A key carries one or more scopes. Pass them in the JSON body as `{"scopes":["bot","tx"]}`, or as
+query `scope=<one>` / `scopes=<a>,<b>`. The body wins when both are present. An unknown body field
+is refused with `422` — never silently dropped.
 
 | Scope | Grants |
 |---|---|
@@ -77,6 +82,20 @@ curl -X DELETE "$ADMIN/admin/tokens/7" -H "X-Admin-API-Key: $ADMIN_TOKEN"   # �
 ```
 
 Set an expiry at mint time with `expires_in=<seconds>`; expired keys are rejected automatically.
+
+### Login-minted tokens (`terminal-login`)
+
+When a user signs in through the terminal (OAuth or email login), the terminal mints an API token
+named **`terminal-login`** to populate the auth cookie. These are **bounded per user**: after each
+sign-in the terminal keeps only the newest `VEXA_TERMINAL_LOGIN_TOKEN_CAP` (default `3`) and revokes
+the older ones. So when you audit a user's tokens —
+
+```bash
+curl "$ADMIN/admin/users/1/tokens" -H "X-Admin-API-Key: $ADMIN_TOKEN"
+```
+
+— the `terminal-login`-named entries are login sessions (capped, not unbounded), while any
+differently-named entries are self-serve keys the user minted and are never pruned by login.
 
 ## What can go wrong
 

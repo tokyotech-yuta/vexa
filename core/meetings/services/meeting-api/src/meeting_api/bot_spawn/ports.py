@@ -34,6 +34,16 @@ class MeetingRepo(Protocol):
         set; ``stopping`` is in-flight too — see ``_ACTIVE_STATUSES``)."""
         ...
 
+    async def find_active_by_userdata(self, userdata_s3_path: str) -> Optional[dict]:
+        """Any user's ACTIVE meeting whose spawn carried this ``userdata_s3_path``
+        (``meeting.data.auth_userdata_path``), or ``None``. The per-identity serialization
+        boundary for authenticated bots: one stored browser session = one Google identity =
+        one live cookie jar, so a second concurrent spawn against the same path is refused
+        (→ HTTP 409, ``AuthSessionBusy``) — running one identity from N containers/IPs at
+        once is both an account-risk signal and a write-back race. Cross-user by design:
+        the identity is deployment-scoped, not per-user."""
+        ...
+
     async def find_latest(self, user_id: int, platform: str, native_meeting_id: str) -> Optional[dict]:
         """The user's MOST-RECENT meeting for ``(platform, native_id)`` regardless of status, or
         ``None``. ``continue_meeting`` reuses this row when it is TERMINAL (completed/failed)."""
@@ -96,6 +106,16 @@ class MeetingRepo(Protocol):
 
     async def set_bot_container(self, *, meeting_id: int, bot_container_id: str) -> dict:
         """Record the kernel-assigned workload id/name on the meeting and return the updated row."""
+        ...
+
+    async def fail_meeting(
+        self, *, meeting_id: int, reason: str, failure_stage: str = "requested"
+    ) -> Optional[dict]:
+        """Mark a meeting ``failed`` BY ID (no session_uid), stamping ``reason``/``failure_stage`` into
+        ``meeting.data`` — the spawn-time failure path (#718). A workload dead on arrival is refused
+        BEFORE the ``MeetingSession`` exists, so the session-keyed ``update_meeting_status`` cannot
+        reach the row; this fails it directly so no ``requested`` row lingers for the reaper to flip
+        reason-less. Returns the updated row (or ``None`` for an unknown id)."""
         ...
 
     async def count_active_bots(self, *, user_id: int, exclude_meeting_id: Optional[int] = None) -> int:
@@ -183,6 +203,31 @@ class MaxBotsExceeded(Exception):
         super().__init__(f"User has reached the maximum concurrent bot limit ({cap}).")
 
 
+class AuthSessionNotConfigured(Exception):
+    """``BOT_AUTHENTICATED=true`` without a complete userdata store config — HTTP 503.
+
+    Authenticated mode is a deployment property: the knob demands ``BOT_USERDATA_S3_PATH`` +
+    ``BOT_S3_ENDPOINT`` + ``BOT_S3_BUCKET`` (scoped credentials via ``BOT_S3_ACCESS_KEY`` /
+    ``BOT_S3_SECRET_KEY``). A spawn is refused loud BEFORE any DB write — never a bot that
+    silently joins anonymous when the operator configured signed-in."""
+
+
+class AuthSessionBusy(Exception):
+    """A second concurrent authenticated spawn against the SAME stored session — HTTP 409.
+
+    Names the conflicting meeting so the operator can wait for or stop it. One identity,
+    one writer: serializing spawns per ``userdata_s3_path`` protects both the account's
+    risk posture (one cookie jar live from one place) and write-back integrity."""
+
+    def __init__(self, conflicting_meeting_id: int, userdata_s3_path: str):
+        self.conflicting_meeting_id = conflicting_meeting_id
+        self.userdata_s3_path = userdata_s3_path
+        super().__init__(
+            f"authenticated session '{userdata_s3_path}' is in use by active meeting "
+            f"{conflicting_meeting_id} — one stored session runs one bot at a time"
+        )
+
+
 class SpawnFailed(Exception):
     """The runtime kernel could not start the workload (non-201, non-429) — meeting → failed.
 
@@ -215,3 +260,29 @@ class DuplicateMeeting(Exception):
     Raised by ``MeetingRepo.create_meeting_guarded`` (the atomic dedup) — either because the in-txn
     dedup query found an active row, or because the unique partial index on active rows rejected the
     concurrent insert (the DB-level backstop). Re-exported from ``service`` for the router's mapping."""
+
+
+# Statuses in which the bot has NOT yet reached the meeting. Their row goes quiet by DESIGN — a bot
+# parked in a waiting room reports `awaiting_admission` once and then polls silently for the whole
+# lobby budget the control plane handed it — so they carry their OWN (longer) reconcile window.
+PRE_ACTIVE_MEETING_STATUSES = frozenset({"requested", "joining", "awaiting_admission"})
+
+
+def reconcile_grace_for_status(
+    status: Optional[str],
+    stop_grace: float,
+    active_grace: float,
+    preactive_grace: Optional[float] = None,
+) -> float:
+    """The reconcile window a stale row is measured against — the ONE definition both the SQL adapter
+    and the in-memory fake read, so the two listings can never drift.
+
+      * ``stopping``   → ``stop_grace``      (a stop was requested: clear it fast)
+      * PRE-ACTIVE     → ``preactive_grace`` (must OUTLAST the lobby budget we issued — #862)
+      * everything else→ ``active_grace``    (a bot-present row: a longer idle before we look)
+    """
+    if status == "stopping":
+        return stop_grace
+    if status in PRE_ACTIVE_MEETING_STATUSES:
+        return active_grace if preactive_grace is None else preactive_grace
+    return active_grace

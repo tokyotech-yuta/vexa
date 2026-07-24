@@ -38,6 +38,20 @@ class QuotaExceeded(Exception):
         super().__init__(f"owner {owner!r} at quota cap ({cap})")
 
 
+class StartFailed(Exception):
+    """Raised by create() when the backend could not START the workload (e.g. the docker
+    image is absent → a 404 on container create). The honest ``stopped``/``start_failed``
+    record is persisted and its RuntimeEvent emitted BEFORE this raises, so ``GET /workloads``
+    and the callback stream still tell the truth; the raise carries the backend's own reason
+    text so the API answers a non-201 that NAMES the cause instead of a false ``spawned`` 201
+    over a workload that never came up."""
+
+    def __init__(self, workload_id: str, reason: str) -> None:
+        self.workload_id = workload_id
+        self.reason = reason
+        super().__init__(reason)
+
+
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
@@ -159,9 +173,10 @@ class Runtime:
         if existing is not None and existing.state in (RuntimeState.starting, RuntimeState.running):
             return existing
 
-        runnable = self.profiles.resolve(spec.profile)
-        if runnable is None:
+        profile = self.profiles.get(spec.profile)
+        if profile is None:
             raise ValueError(f"unknown profile: {spec.profile!r}")
+        runnable = profile.runnable
 
         # Quota check (O-RT-2): reject the N+1th active workload for this owner.
         if self.owner_quota is not None:
@@ -176,14 +191,23 @@ class Runtime:
         self._persist(spec, status)
         self._emit(spec.workloadId, RuntimeState.starting)
         try:
-            self._handles[spec.workloadId] = self.backend.start(spec.workloadId, runnable, spec.env)
-        except Exception:
+            # The profile's base_env is the deployment-wide floor (e.g. meeting-bot's BOT_SPEAKER_*
+            # tuning, rendered onto the runtime pod by the chart); the per-workload spec.env is
+            # layered on top so an explicit spec value always wins. Without this merge the base_env
+            # never reaches the spawned pod and chart-set tuning is dead config (issue #771).
+            effective_env = {**profile.base_env, **spec.env}
+            self._handles[spec.workloadId] = self.backend.start(spec.workloadId, runnable, effective_env)
+        except Exception as exc:
+            # Record the honest terminal state (persist + emit) FIRST — GET /workloads and the
+            # callback stream must still see stopped/start_failed — THEN raise so the API answers a
+            # non-201 naming the cause. A caught-and-returned status here is a false "spawned" 201
+            # over a workload that never came up (#718): the create response must not read as success.
             status.state = RuntimeState.stopped
             status.stopReason = StopReason.start_failed
             status.stoppedAt = _now()
             self._persist(spec, status)
             self._emit(spec.workloadId, RuntimeState.stopped, stopReason=StopReason.start_failed)
-            return status
+            raise StartFailed(spec.workloadId, str(exc)) from exc
         status.state = RuntimeState.running
         status.startedAt = _now()
         status.ports = {}
